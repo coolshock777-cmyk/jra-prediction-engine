@@ -16,6 +16,42 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+import streamlit as st
+
+# --- 簡易パスワード認証機能 ---
+def check_password():
+    """st.secrets に設定されたパスワードで認証を行う"""
+    # secrets にパスワードが設定されていない場合の安全策
+    if "APP_PASSWORD" not in st.secrets:
+        st.error("Secrets に 'APP_PASSWORD' が設定されていません。")
+        return False
+
+    # セッション状態の初期化
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    # 認証済みであれば True を返す
+    if st.session_state["password_correct"]:
+        return True
+
+    # ログインフォームの表示
+    st.title("🔒 ログイン")
+    password_input = st.text_input("パスワードを入力してください", type="password")
+
+    if st.button("ログイン"):
+        if password_input == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            st.rerun()  # 画面をリロードしてメイン処理へ
+        else:
+            st.error("❌ パスワードが正しくありません")
+
+    return False
+
+# 認証チェックの実行
+if not check_password():
+    st.stop()  # 認証未完了の場合はここで処理を一時停止
+
+# --- ここから下に既存のメインロジック（16大分析やUI等）を記述 ---
 
 st.title("🏇 JRA AI競馬予想エンジン 【16大分析＆自動資金配分】")
 
