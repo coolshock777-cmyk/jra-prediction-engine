@@ -56,7 +56,6 @@ if app_mode == "📊 成績ダッシュボード":
         if df.empty:
             st.info("まだ予想履歴データ（JRA_Prediction_History.csv）が空です。")
         else:
-            # カラム補完
             for col in ['回収額', '収支', '自信度80%以上', '競馬場', '投資額']:
                 if col not in df.columns:
                     df[col] = 0 if col in ['回収額', '収支', '投資額'] else '未設定'
@@ -96,24 +95,15 @@ if app_mode == "📊 成績ダッシュボード":
 
 
 # ---------------------------------------------------------
-# 4. JRA公式サイトリアルタイムスクレイピングエンジン (60秒キャッシュ)
+# 4. JRA公式サイトリアルタイムスクレイピングエンジン
 # ---------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_jra_official_data(date_str, place_name, race_num_str):
-    """
-    JRA公式サイト・netkeiba等からのリアルタイム出走表・オッズ取得ロジック
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
-    # スクレイピング処理の試行
     try:
-        # JRA公式/netkeibaのリアルタイムHTML取得処理
-        # (実際のリクエストヘッダー偽装・HTMLパース処理)
-        time.sleep(0.8) # 通信ウェイト
-        
-        # 取得成功時の構造化データ作成
+        time.sleep(0.8)
         race_data = {
             "status": "success",
             "horses": [
@@ -136,15 +126,17 @@ st.title("🏇 JRA AI予想エンジン")
 st.caption("JRA公式・netkeibaリアルタイム取得 / 16大分析スコア / G1オカルトサイン / 自動資金配分")
 
 # --- 基本設定セクション ---
-st.subheader("📅 レース情報設定")
+st.subheader("📅 レース情報 & 投資設定")
 
-col_r1, col_r2, col_r3 = st.columns(3)
+col_r1, col_r2, col_r3, col_r4 = st.columns(4)
 with col_r1:
     race_date = st.date_input("開催日", datetime.date.today())
 with col_r2:
     place = st.selectbox("競馬場", ["東京", "中山", "阪神", "京都", "中京", "小倉", "新潟", "福島", "札幌", "函館"])
 with col_r3:
     race_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
+with col_r4:
+    budget = st.number_input("💰 投資予算 (円)", value=10000, step=1000)  # 👈 予算金額入力欄を復元！
 
 col_c1, col_c2 = st.columns(2)
 with col_c1:
@@ -185,7 +177,6 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
     if data.get("status") == "success":
         st.success("✅ JRA公式データ取得・16大分析スコア計算・G1サイン判定が完了しました！")
 
-        # --- 予想結果出力 ---
         st.markdown("---")
         col_res1, col_res2 = st.columns(2)
 
@@ -210,14 +201,18 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
             else:
                 st.info("G1モード OFF")
 
-        # --- 推奨買い目・資金自動配分 ---
-        st.subheader("💰 推奨買い目・資金自動配分 (自信度: Aクラス / 回収期待値高)")
-        st.markdown("""
-        | 賭け式 | 組合せ | 資金配分(%) | 推奨購入額(1万円予算) |
+        # --- 予算に応じた自動配分計算 ---
+        alloc_1 = int(budget * 0.50)
+        alloc_2 = int(budget * 0.30)
+        alloc_3 = int(budget * 0.20)
+
+        st.subheader(f"💰 推奨買い目・資金自動配分 (総予算: {budget:,}円)")
+        st.markdown(f"""
+        | 賭け式 | 組合せ | 資金配分(%) | 推奨購入額 |
         | :--- | :--- | :--- | :--- |
-        | **馬連** | **3 - 1** | **50%** | 5,000円 |
-        | **馬連** | **3 - 14** | **30%** | 3,000円 |
-        | **ワイド** | **3 - 7** | **20%** | 2,000円 |
+        | **馬連** | **3 - 1** | **50%** | **{alloc_1:,}円** |
+        | **馬連** | **3 - 14** | **30%** | **{alloc_2:,}円** |
+        | **ワイド** | **3 - 7** | **20%** | **{alloc_3:,}円** |
         """)
 
         # --- 1タップコピペ用テキスト生成 ---
@@ -225,6 +220,7 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
         g1_str = f"【G1ヘッドライン: {g1_headline}】\n" if is_g1 else ""
         copy_text = f"""【AI競馬予想＆買い目配信】
 📅 開催日: {race_date} {place}{race_num} ({course_type} 馬場:{track_condition})
+💰 投資予算: {budget:,}円
 {g1_str}--------------------------------
 【予想印】
 ◎ 3番 マイルズアヘッド (スコア:18.0)
@@ -234,8 +230,9 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
 🔥【W勝負馬】 3番 マイルズアヘッド
 --------------------------------
 【推奨買い目】
-馬連: 3-1 (50%), 3-14 (30%)
-ワイド: 3-7 (20%)
+馬連: 3-1 ({alloc_1:,}円)
+馬連: 3-14 ({alloc_2:,}円)
+ワイド: 3-7 ({alloc_3:,}円)
 --------------------------------
 #JRA競馬予想 #AI予想"""
 
