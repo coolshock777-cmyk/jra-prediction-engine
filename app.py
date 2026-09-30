@@ -98,67 +98,116 @@ if app_mode == "📊 成績ダッシュボード":
 
 
 # ---------------------------------------------------------
-# 4. 実働スクレイピング & 16大分析エンジン
+# 4. 本番用スクレイピング & 16大分析計算エンジン
 # ---------------------------------------------------------
+PLACE_MAP = {
+    "札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
+    "中山": "06", "中京": "07", "京都": "08", "阪神": "09", "小倉": "10"
+}
+
 @st.cache_data(ttl=60)
-def fetch_and_analyze_race(date_str, place_name, race_num_str, track_cond, is_g1_mode, bias_params, lucky_nums_str):
+def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, is_g1_mode, bias_params, lucky_nums_str):
     """
-    JRA公式/netkeibaリアルタイムデータ取得・パース & 16大分析スコア計算処理
+    netkeiba/JRA公式から指定した会場・レース番号の実走データをリアルタイム取得
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # スクレイピング試行 (JRA公式 / netkeiba)
-    # 実戦運用時のフォールバック構造
-    try:
-        # 通信リクエスト（環境保護のためのウェイト）
-        time.sleep(0.5)
-        
-        # 模擬・実戦用HTMLパース構造（スクレイピング失敗時もシステム停止を防ぐフェイルセーフ付）
-        # 出走馬ベースリストの構築
-        horses_base = [
-            {"umaban": 1, "name": "サクラプレジデント", "jockey": "川田", "kinba": 58.0, "base_score": 14.0},
-            {"umaban": 3, "name": "マイルズアヘッド", "jockey": "ルメール", "kinba": 58.0, "base_score": 15.5},
-            {"umaban": 5, "name": "サンライズホース", "jockey": "デムーロ", "kinba": 58.0, "base_score": 7.5},
-            {"umaban": 7, "name": "キングズソード", "jockey": "横山武", "kinba": 58.0, "base_score": 10.0},
-            {"umaban": 14, "name": "ディープシャドウ", "jockey": "武豊", "kinba": 58.0, "base_score": 12.5},
-        ]
-        
-        # 16大分析・バイアス補正計算
-        lucky_list = [int(x.strip()) for x in lucky_nums_str.split(",") if x.strip().isdigit()]
-        
-        analyzed_horses = []
-        for h in horses_base:
-            score = h["base_score"]
+    year = date_obj.strftime("%Y")
+    place_code = PLACE_MAP.get(place_name, "05")
+    race_r = race_num_str.replace("R", "").zfill(2)
+    
+    # 開催日・競馬場・レース番号に基づく動的URL検索
+    horses_list = []
+    
+    # 複数パターンでの出馬表取得試行 (開催回・開催日数の自動探索)
+    for kai in range(1, 6):
+        for nichi in range(1, 13):
+            race_id = f"{year}{place_code}{kai:02d}{nichi:02d}{race_r}"
+            url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
             
-            # トラックバイアス補正
-            if bias_params["mae"] and h["umaban"] in [1, 2, 3, 4]:
-                score += 1.5
-            if bias_params["uchi"] and h["umaban"] <= 4:
-                score += 1.0
-            if bias_params["sashi"] and h["umaban"] >= 8:
-                score += 1.0
-            if bias_params["green"] and h["umaban"] in [2, 3, 4]:
-                score += 0.5
-                
-            # G1サイン補正
-            if is_g1_mode and h["umaban"] in lucky_list:
-                score += bias_params["sign_weight"]
-                
-            h_copy = h.copy()
-            h_copy["final_score"] = round(score, 1)
-            analyzed_horses.append(h_copy)
+            try:
+                res = requests.get(url, headers=headers, timeout=3)
+                res.encoding = 'euc-jp'
+                if res.status_code == 200 and "Shutuba_Table" in res.text:
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    table = soup.find("table", class_="Shutuba_Table")
+                    if table:
+                        rows = table.find_all("tr", class_="HorseList")
+                        for row in rows:
+                            try:
+                                umaban_elem = row.find("td", class_="Umaban")
+                                umaban = int(umaban_elem.text.strip()) if umaban_elem and umaban_elem.text.strip().isdigit() else 0
+                                
+                                horse_elem = row.find("span", class_="HorseName")
+                                horse_name = horse_elem.text.strip() if horse_elem else ""
+                                
+                                jockey_elem = row.find("td", class_="Jockey")
+                                jockey_name = jockey_elem.text.strip().replace("\n", "") if jockey_elem else "未定"
+                                
+                                kinba_elem = row.find("td", class_="Txt_C")
+                                kinba_txt = kinba_elem.text.strip() if kinba_elem else "58.0"
+                                kinba = float(kinba_txt) if kinba_txt.replace('.', '', 1).isdigit() else 58.0
+                                
+                                odds_elem = row.find("td", class_="Popular")
+                                odds_txt = odds_elem.text.strip() if odds_elem else "10.0"
+                                odds_val = float(odds_txt) if odds_txt.replace('.', '', 1).isdigit() else 10.0
 
-        # スコア順にソート
-        analyzed_horses.sort(key=lambda x: x["final_score"], reverse=True)
-        return {"status": "success", "data": analyzed_horses}
+                                if umaban > 0 and horse_name:
+                                    base_score = round(150.0 / (odds_val + 5.0) + 8.0, 1)
+                                    horses_list.append({
+                                        "umaban": umaban,
+                                        "name": horse_name,
+                                        "jockey": jockey_name,
+                                        "kinba": kinba,
+                                        "odds": odds_val,
+                                        "base_score": base_score
+                                    })
+                            except Exception:
+                                continue
+                        if len(horses_list) > 0:
+                            break
+            except Exception:
+                continue
+        if len(horses_list) > 0:
+            break
 
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    # 対象レースのデータが存在しない場合
+    if not horses_list:
+        return {
+            "status": "not_ready",
+            "message": f"{date_obj} {place_name}{race_num_str} のリアルタイム出馬表データが見つかりません。確定後に再度実行してください。"
+        }
+
+    # 16大分析・バイアス・G1サインスコア計算
+    lucky_list = [int(x.strip()) for x in lucky_nums_str.split(",") if x.strip().isdigit()]
+    analyzed_horses = []
+
+    for h in horses_list:
+        score = h["base_score"]
+        
+        if bias_params["mae"] and h["umaban"] in [1, 2, 3, 4]:
+            score += 1.5
+        if bias_params["uchi"] and h["umaban"] <= 4:
+            score += 1.0
+        if bias_params["sashi"] and h["umaban"] >= 8:
+            score += 1.0
+        if bias_params["green"] and h["umaban"] in [2, 3, 4]:
+            score += 0.5
+            
+        if is_g1_mode and h["umaban"] in lucky_list:
+            score += bias_params["sign_weight"]
+            
+        h_copy = h.copy()
+        h_copy["final_score"] = round(score, 1)
+        analyzed_horses.append(h_copy)
+
+    analyzed_horses.sort(key=lambda x: x["final_score"], reverse=True)
+    return {"status": "success", "data": analyzed_horses}
 
 
-# CSVへの予想ログ保存関数
+# CSV保存
 def save_prediction_to_csv(log_data):
     try:
         file_exists = os.path.exists(CSV_FILE_PATH)
@@ -178,9 +227,8 @@ def save_prediction_to_csv(log_data):
 # 5. 🏇 リアルタイム予想メイン画面
 # ---------------------------------------------------------
 st.title("🏇 JRA AI予想エンジン")
-st.caption("JRA公式・netkeibaリアルタイム取得 / 16大分析スコア / G1オカルトサイン / 自動資金配分")
+st.caption("JRA公式・netkeibaリアルタイム解析 / 16大分析スコア / G1オカルトサイン / 自動資金配分")
 
-# --- 基本設定セクション ---
 st.subheader("📅 レース情報 & 投資設定")
 
 col_r1, col_r2, col_r3, col_r4 = st.columns(4)
@@ -201,7 +249,6 @@ with col_c2:
 
 is_g1 = st.checkbox("🏆 G1レースモード（サイン・ヘッドライン分析発動）", value=True)
 
-# --- G1オカルトサイン予想設定 ---
 sign_weight = 1.5
 lucky_number = "3, 7, 14"
 g1_headline = ""
@@ -215,7 +262,6 @@ if is_g1:
         presenter_note = st.text_input("プレゼンター・イベント特注サイン", "赤枠 / 3枠注意")
         sign_weight = st.slider("サインスコア重み付け補正", 0.0, 3.0, 1.5)
 
-# --- トラックバイアス補正設定 ---
 st.subheader("⚙️ トラックバイアス・傾向補正")
 col_b1, col_b2, col_b3, col_b4 = st.columns(4)
 with col_b1:
@@ -235,22 +281,21 @@ bias_params = {
     "sign_weight": sign_weight
 }
 
-# --- 分析実行 ---
 if st.button("🚀 リアルタイム分析・予想計算スタート", type="primary"):
-    with st.spinner(f"🌐 {race_date} {place}{race_num} の出走表・オッズデータを取得 & 16大分析計算中..."):
-        res = fetch_and_analyze_race(
-            str(race_date), place, race_num, track_condition, is_g1, bias_params, lucky_number
+    with st.spinner(f"🌐 リアルタイム出馬表・オッズデータを解析中 ({race_date} {place}{race_num})..."):
+        res = fetch_and_analyze_real_race(
+            race_date, place, race_num, track_condition, is_g1, bias_params, lucky_number
         )
 
     if res.get("status") == "success":
         horses = res["data"]
-        st.success("✅ JRA公式データ取得・16大分析スコア計算・G1サイン判定が完了しました！")
+        st.success("✅ 実走データの取得・16大分析スコア計算・G1サイン判定が完了しました！")
 
-        honmei = horses[0]
-        taikou = horses[1]
-        tanana = horses[2]
-        tokuchu = horses[3]
-        kiken = horses[4]
+        honmei = horses[0] if len(horses) > 0 else {"umaban": "-", "name": "-", "final_score": 0}
+        taikou = horses[1] if len(horses) > 1 else {"umaban": "-", "name": "-", "final_score": 0}
+        tanana = horses[2] if len(horses) > 2 else {"umaban": "-", "name": "-", "final_score": 0}
+        tokuchu = horses[3] if len(horses) > 3 else {"umaban": "-", "name": "-", "final_score": 0}
+        kiken = horses[-1] if len(horses) > 4 else {"umaban": "-", "name": "-", "final_score": 0}
 
         st.markdown("---")
         col_res1, col_res2 = st.columns(2)
@@ -276,7 +321,6 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
             else:
                 st.info("G1モード OFF")
 
-        # --- 予算に応じた自動配分計算 ---
         alloc_1 = int(budget * 0.50)
         alloc_2 = int(budget * 0.30)
         alloc_3 = int(budget * 0.20)
@@ -290,7 +334,6 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
         | **ワイド** | **{honmei['umaban']} - {tokuchu['umaban']}** | **20%** | **{alloc_3:,}円** |
         """)
 
-        # --- 1タップコピペ用テキスト生成 ---
         g1_str = f"【G1ヘッドライン: {g1_headline}】\n" if is_g1 else ""
         copy_text = f"""【AI競馬予想＆買い目配信】
 📅 開催日: {race_date} {place}{race_num} ({course_type} 馬場:{track_condition})
@@ -313,7 +356,6 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
         st.subheader("📋 1タップコピペ用テキスト")
         st.code(copy_text, language="text")
 
-        # CSVへの実保存
         log_entry = {
             "予想日時": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "開催日": str(race_date),
@@ -329,5 +371,7 @@ if st.button("🚀 リアルタイム分析・予想計算スタート", type="p
         if save_prediction_to_csv(log_entry):
             st.caption("✅ 予想結果ログを JRA_Prediction_History.csv へ正常に保存しました。")
 
+    elif res.get("status") == "not_ready":
+        st.warning(f"⚠️ {res.get('message')}")
     else:
-        st.error(f"データ取得・解析に失敗しました: {res.get('message')}")
+        st.error(f"データ取得・解析エラー: {res.get('message')}")
