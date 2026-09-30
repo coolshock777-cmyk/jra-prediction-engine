@@ -50,7 +50,56 @@ def check_password():
 # 認証チェックの実行
 if not check_password():
     st.stop()  # 認証未完了の場合はここで処理を一時停止
+import pandas as pd
+import numpy as np
 
+def render_analytics_dashboard(csv_path="JRA_Prediction_History.csv"):
+    st.header("📊 予想履歴・成績ダッシュボード")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        st.warning("⚠️ 予想履歴データ（JRA_Prediction_History.csv）が見つかりません。")
+        return
+    except Exception as e:
+        st.error(f"データの読み込みエラー: {e}")
+        return
+
+    if df.empty:
+        st.info("まだ予想履歴データが登録されていません。")
+        return
+
+    # 必須カラムの初期化・補完
+    for col in ['投資額', '回収額', '的中判定', '自信度', '競馬場']:
+        if col not in df.columns:
+            df[col] = 0 if col in ['投資額', '回収額'] else '未設定'
+
+    df['投資額'] = pd.to_numeric(df['投資額'], errors='coerce').fillna(0)
+    df['回収額'] = pd.to_numeric(df['回収額'], errors='coerce').fillna(0)
+    df['収支'] = df['回収額'] - df['投資額']
+
+    total_races = len(df)
+    total_invest = df['投資額'].sum()
+    total_return = df['回収額'].sum()
+    total_balance = total_return - total_invest
+    recovery_rate = (total_return / total_invest * 100) if total_invest > 0 else 0
+    
+    hit_races = len(df[df['回収額'] > 0])
+    hit_rate = (hit_races / total_races * 100) if total_races > 0 else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総予想", f"{total_races} 件")
+    col2.metric("回収率", f"{recovery_rate:.1f} %")
+    col3.metric("的中率", f"{hit_rate:.1f} %")
+    col4.metric("総収支", f"{total_balance:+,.0f} 円")
+
+    st.markdown("---")
+    st.subheader("📈 累計収支推移")
+    df['累計収支'] = df['収支'].cumsum()
+    st.line_chart(df['累計収支'])
+
+    st.subheader("📋 予想・反省ログ一覧")
+    st.dataframe(df.sort_index(ascending=False), use_container_width=True)
 # --- ここから下に既存のメインロジック（16大分析やUI等）を記述 ---
 
 st.title("🏇 JRA AI競馬予想エンジン 【16大分析＆自動資金配分】")
