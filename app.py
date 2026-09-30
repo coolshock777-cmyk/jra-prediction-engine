@@ -98,7 +98,7 @@ if app_mode == "📊 成績ダッシュボード":
 
 
 # ---------------------------------------------------------
-# 4. 本番用最適化スクレイピング & 16大分析計算エンジン
+# 4. 本番用スクレイピング & 16大分析計算エンジン
 # ---------------------------------------------------------
 PLACE_MAP = {
     "札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
@@ -107,6 +107,9 @@ PLACE_MAP = {
 
 @st.cache_data(ttl=60)
 def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, is_g1_mode, bias_params, lucky_nums_str):
+    """
+    netkeiba/JRA公式から指定した会場・レース番号の実走データをリアルタイム取得
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -117,14 +120,14 @@ def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, 
     
     horses_list = []
     
-    # 直近の秋開催パターン（第4回〜第5回、1〜8日目）を優先検索
-    for kai in [4, 5, 3, 2, 1]:
-        for nichi in range(1, 9):
+    # 開催回・開催日数の自動探索
+    for kai in range(1, 6):
+        for nichi in range(1, 13):
             race_id = f"{year}{place_code}{kai:02d}{nichi:02d}{race_r}"
             url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
             
             try:
-                res = requests.get(url, headers=headers, timeout=1.5)
+                res = requests.get(url, headers=headers, timeout=3)
                 res.encoding = 'euc-jp'
                 if res.status_code == 200 and "Shutuba_Table" in res.text:
                     soup = BeautifulSoup(res.text, "html.parser")
@@ -150,6 +153,7 @@ def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, 
                                 odds_txt = odds_elem.text.strip() if odds_elem else "10.0"
                                 odds_val = float(odds_txt) if odds_txt.replace('.', '', 1).isdigit() else 10.0
 
+                                # 有効な馬データのみ抽出
                                 if umaban > 0 and horse_name:
                                     base_score = round(150.0 / (odds_val + 5.0) + 8.0, 1)
                                     horses_list.append({
@@ -162,6 +166,7 @@ def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, 
                                     })
                             except Exception:
                                 continue
+                        
                         if len(horses_list) > 0:
                             break
             except Exception:
@@ -169,12 +174,14 @@ def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, 
         if len(horses_list) > 0:
             break
 
+    # 対象レースのデータが存在しない場合
     if not horses_list:
         return {
             "status": "not_ready",
-            "message": f"{date_obj} 【{place_name}】{race_num_str} の出馬表データがまだ確定前か未取得です。本日夕方〜明日の枠順確定後に再度お試しください。"
+            "message": f"{date_obj} {place_name}{race_num_str} のリアルタイム出馬表データが見つかりません。確定後に再度実行してください。"
         }
 
+    # 16大分析・バイアス・G1サインスコア計算
     lucky_list = [int(x.strip()) for x in lucky_nums_str.split(",") if x.strip().isdigit()]
     analyzed_horses = []
 
@@ -201,6 +208,7 @@ def fetch_and_analyze_real_race(date_obj, place_name, race_num_str, track_cond, 
     return {"status": "success", "data": analyzed_horses}
 
 
+# CSV保存
 def save_prediction_to_csv(log_data):
     try:
         file_exists = os.path.exists(CSV_FILE_PATH)
@@ -228,7 +236,7 @@ col_r1, col_r2, col_r3, col_r4 = st.columns(4)
 with col_r1:
     race_date = st.date_input("開催日", datetime.date.today())
 with col_r2:
-    place = st.selectbox("競馬場", ["東京", "京都", "中山", "阪神", "中京", "小倉", "新潟", "福島", "札幌", "函館"])
+    place = st.selectbox("競馬場", ["東京", "中山", "阪神", "京都", "中京", "小倉", "新潟", "福島", "札幌", "函館"])
 with col_r3:
     race_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
 with col_r4:
@@ -240,7 +248,7 @@ with col_c1:
 with col_c2:
     track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"])
 
-is_g1 = st.checkbox("🏆 G1/重賞モード（サイン・ヘッドライン分析発動）", value=True)
+is_g1 = st.checkbox("🏆 G1レースモード（サイン・ヘッドライン分析発動）", value=True)
 
 sign_weight = 1.5
 lucky_number = "3, 7, 14"
