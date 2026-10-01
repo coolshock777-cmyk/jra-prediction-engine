@@ -46,6 +46,10 @@ app_mode = st.sidebar.radio(
     ["🏇 リアルタイム予想", "📊 成績ダッシュボード・結果入力"]
 )
 
+# サイドバー最下部にバージョン表示を追加
+st.sidebar.markdown("---")
+st.sidebar.caption("🤖 Engine Version: **Ver.1.00**")
+
 CSV_FILE_PATH = "JRA_Prediction_History.csv"
 
 # 全必須カラムの定義（旧フォーマット互換用）
@@ -355,7 +359,13 @@ def save_prediction_to_csv(log_data):
 # ---------------------------------------------------------
 # 5. 🏇 リアルタイム予想メイン画面
 # ---------------------------------------------------------
-st.title("🏇 JRA AI予想エンジン")
+# メイン画面ヘッダーにバージョン表示を追加
+col_title1, col_title2 = st.columns([0.75, 0.25])
+with col_title1:
+    st.title("🏇 JRA AI予想エンジン")
+with col_title2:
+    st.markdown("### `Ver.1.00`")
+
 st.caption("多特徴量ルールベース予測エンジン / モデル評価シェア ＆ AI価値指数算出 / 資金配分 / 的中検証機能")
 
 st.subheader("📅 レース情報 & 投資設定")
@@ -522,7 +532,7 @@ if st.button("🚀 多特徴量予測エンジン実行・予想計算スター�
         
         save_status = save_prediction_to_csv(log_entry)
         if save_status == "updated":
-            st.info("ℹ️️ 既存レースの予想情報を最新に更新しました（確定済みの成績・投資額データは保護されます）。")
+            st.info("ℹ️ 既存レースの予想情報を最新に更新しました（確定済みの成績・投資額データは保護されます）。")
         elif save_status == "created":
             st.caption("✅ 新規予想ログを保存しました。「成績ダッシュボード」からレース終了後の払戻金を入力して回収率を更新できます。")
 
