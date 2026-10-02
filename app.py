@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.04"
+VERSION = "Ver.2.05"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -390,7 +390,6 @@ def fetch_fallback_odds_dict(race_id: str) -> dict:
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 馬番セルとオッズセルを探す
         rows = soup.find_all("tr", id=re.compile(r"odds-td-\d+|row-\d+"))
 
         if not rows:
@@ -400,7 +399,6 @@ def fetch_fallback_odds_dict(race_id: str) -> dict:
 
             try:
 
-                # 馬番
                 uma_td = row.find(re.compile("td|span"), class_=re.compile("Umaban|Num"))
 
                 if not uma_td:
@@ -415,12 +413,10 @@ def fetch_fallback_odds_dict(race_id: str) -> dict:
 
                 uma_num = int(m_uma.group())
 
-                # 単勝オッズ
                 odds_td = row.find(re.compile("td|span"), id=re.compile(r"odds-1_") or class_=re.compile("Odds"))
 
                 if not odds_td:
 
-                    # Txt_Rなどの右寄せセルから検出
                     tds = row.find_all("td")
 
                     for td in tds:
@@ -643,7 +639,6 @@ def fetch_netkeiba_race_data_cached(
 
             try:
 
-                # 枠番
                 waku_elem = row.find(
                     "td",
                     class_=re.compile("Waku")
@@ -668,7 +663,6 @@ def fetch_netkeiba_race_data_cached(
                     else 0
                 )
 
-                # 馬番
                 uma_elem = row.find(
                     "td",
                     class_=re.compile("Umaban")
@@ -693,7 +687,6 @@ def fetch_netkeiba_race_data_cached(
                     else 0
                 )
 
-                # 馬名
                 horse_elem = row.find(
                     "span",
                     class_="HorseName"
@@ -708,7 +701,6 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
-                # 騎手
                 jockey_elem = row.find(
                     "td",
                     class_="Jockey"
@@ -723,7 +715,6 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
-                # 斤量
                 kinryo = 55.0
                 td_elems = row.find_all("td")
                 for td in td_elems:
@@ -733,7 +724,6 @@ def fetch_netkeiba_race_data_cached(
                         kinryo = float(m_kin.group(1))
                         break
 
-                # 脚質
                 style_elem = row.find(
                     "td",
                     class_=re.compile(
@@ -770,7 +760,6 @@ def fetch_netkeiba_race_data_cached(
 
                         front_runner_count += 1
 
-                # 出馬表側からのオッズ判定
                 odds = None
 
                 odds_elem = row.find(re.compile("td|span"), id=re.compile(r"odds-\d+_\d+"))
@@ -806,10 +795,6 @@ def fetch_netkeiba_race_data_cached(
                 "出走馬データの抽出件数が0件です。"
             )
 
-        # ----------------------------------------------------
-        # フォールバック: オッズ不足時は専用ページから補正
-        # ----------------------------------------------------
-
         valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
 
         if (valid_odds_count / len(horses)) < 0.70:
@@ -826,7 +811,6 @@ def fetch_netkeiba_race_data_cached(
 
                         h["オッズ"] = fallback_odds[uma_num]
 
-        # 最終確認
         valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
 
         odds_coverage = (
@@ -1328,7 +1312,7 @@ if mode == "🏇 リアルタイム予想":
             )
 
     st.markdown(
-        "### ⚙️️ モデル条件"
+        "### ⚙️ モデル条件"
     )
 
     c1, c2, c3 = st.columns(3)
@@ -1807,7 +1791,7 @@ if mode == "🏇 リアルタイム予想":
         with r3:
 
             st.subheader(
-                "⚙️️ 設定"
+                "⚙️ 設定"
             )
 
             st.write(
