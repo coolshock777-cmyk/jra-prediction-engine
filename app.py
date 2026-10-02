@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.00"
+VERSION = "Ver.2.01"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -327,7 +327,7 @@ def parse_distance_from_text(text: str) -> str:
 
 
 # ============================================================
-# 7. オッズ抽出
+# 7. オッズ抽出（厳格判定）
 # ============================================================
 
 def parse_odds(text: str):
@@ -337,8 +337,9 @@ def parse_odds(text: str):
 
     text = str(text).strip()
 
+    # オッズは基本的に小数点を含む（例: 3.4, 12.8, 100.5）
     match = re.search(
-        r"(?<!\d)(\d+(?:\.\d+))(?!\d)",
+        r"(\d+\.\d+)",
         text
     )
 
@@ -349,7 +350,7 @@ def parse_odds(text: str):
 
         value = float(match.group(1))
 
-        if value > 0:
+        if value >= 1.0:
             return value
 
     except Exception:
@@ -359,7 +360,7 @@ def parse_odds(text: str):
 
 
 # ============================================================
-# 8. netkeibaデータ取得
+# 8. netkeibaデータ取得（斤量対応）
 # ============================================================
 
 @st.cache_data(
@@ -550,6 +551,7 @@ def fetch_netkeiba_race_data_cached(
 
             try:
 
+                # 枠番
                 waku_elem = row.find(
                     "td",
                     class_=re.compile("Waku")
@@ -574,6 +576,7 @@ def fetch_netkeiba_race_data_cached(
                     else 0
                 )
 
+                # 馬番
                 uma_elem = row.find(
                     "td",
                     class_=re.compile("Umaban")
@@ -598,6 +601,7 @@ def fetch_netkeiba_race_data_cached(
                     else 0
                 )
 
+                # 馬名
                 horse_elem = row.find(
                     "span",
                     class_="HorseName"
@@ -612,6 +616,7 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
+                # 騎手
                 jockey_elem = row.find(
                     "td",
                     class_="Jockey"
@@ -626,6 +631,22 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
+                # 斤量 (Kinryo) 抽出
+                weight_elem = row.find(
+                    "td",
+                    class_=re.compile("Txt_C|Weight|Jockey")
+                )
+
+                # netkeibaの標準構造から斤量を正規表現で探索 (例: 57.0, 55.0)
+                row_full_text = row.get_text(" ", strip=True)
+                weight_match = re.search(r"(\d{2}\.\d)", row_full_text)
+                
+                if weight_match:
+                    kinryo = float(weight_match.group(1))
+                else:
+                    kinryo = 55.0 # fallback
+
+                # 脚質
                 style_elem = row.find(
                     "td",
                     class_=re.compile(
@@ -662,14 +683,18 @@ def fetch_netkeiba_race_data_cached(
 
                         front_runner_count += 1
 
+                # 厳格な単勝オッズ抽出
                 odds = None
 
                 odds_elem = row.find(
-                    "span",
-                    class_=re.compile(
-                        "Odds|Popular_Ninki"
-                    )
+                    "td",
+                    class_=re.compile("Odds")
                 )
+                if not odds_elem:
+                    odds_elem = row.find(
+                        "span",
+                        class_=re.compile("Popular_Ninki|Odds")
+                    )
 
                 if odds_elem:
 
@@ -680,35 +705,7 @@ def fetch_netkeiba_race_data_cached(
                         )
                     )
 
-                if odds is None:
-
-                    row_text = row.get_text(
-                        " ",
-                        strip=True
-                    )
-
-                    candidates = re.findall(
-                        r"(?<!\d)(\d+\.\d+)(?!\d)",
-                        row_text
-                    )
-
-                    for candidate in candidates:
-
-                        try:
-
-                            candidate_value = float(
-                                candidate
-                            )
-
-                            if candidate_value >= 1.0:
-
-                                odds = candidate_value
-                                break
-
-                        except Exception:
-                            continue
-
-                if odds is not None and odds > 0:
+                if odds is not None and odds >= 1.0:
 
                     valid_odds_count += 1
 
@@ -720,6 +717,7 @@ def fetch_netkeiba_race_data_cached(
                             "馬番": uma,
                             "馬名": horse_name,
                             "騎手": jockey,
+                            "斤量": kinryo,
                             "脚質": kyakushitsu,
                             "オッズ": odds,
                         }
@@ -1035,7 +1033,7 @@ if mode == "🏇 リアルタイム予想":
     )
 
     st.info(
-        "このモデルは、出走馬情報・騎手・脚質・枠・"
+        "このモデルは、出走馬情報・騎手・斤量・脚質・枠・"
         "コース条件などからモデル内相対評価を算出し、"
         "その後に市場オッズと比較してValue Indexを計算します。"
     )
@@ -1220,7 +1218,7 @@ if mode == "🏇 リアルタイム予想":
             )
 
         with st.expander(
-            "🐎 取得した出走馬データを確認"
+            "🐎 取得した出走馬データを確認（斤量・オッズ）"
         ):
 
             horse_preview = pd.DataFrame(
@@ -1463,6 +1461,12 @@ if mode == "🏇 リアルタイム予想":
                         horse.get(
                             "騎手",
                             ""
+                        )
+                    ),
+                    "斤量": float(
+                        horse.get(
+                            "斤量",
+                            55.0
                         )
                     ),
                     "脚質": str(
