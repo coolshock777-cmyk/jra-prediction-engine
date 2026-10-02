@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.25"
+VERSION = "Ver.2.26"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -1503,32 +1503,35 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
             class_=re.compile(r"\bHorseList\b"),
         )
 
-        if len(horse_rows) < 4:
-            fallback_rows = []
-            for tr in soup.find_all("tr"):
-                umaban_elem = tr.find(
-                    ["td", "th"],
-                    class_=re.compile(
-                        r"Umaban|UmabanNum|UmabanCell", re.I
-                    ),
-                )
-                if umaban_elem is None:
-                    continue
+        # netkeibaの現在のHTMLでは、全出走馬の行にHorseListクラスが
+        # 安定して付かないケースがある。また馬番セルのclass名も変更される
+        # ことがあるため、「馬名のDBリンクを含むtr」を強力なフォールバック
+        # として利用する。
+        fallback_rows = []
+        for tr in soup.find_all("tr"):
+            horse_links = tr.select("a[href*='/horse/']")
+            if not horse_links:
+                continue
 
-                umaban_text = normalize_text(
-                    umaban_elem.get_text(" ", strip=True)
-                )
-                if re.fullmatch(r"(?:1[0-8]|[1-9])", umaban_text):
-                    fallback_rows.append(tr)
+            # 馬名リンクがあり、行内に枠番・馬番らしい数字が2つ以上ある
+            # 行だけを出走馬候補とする。
+            numeric_cells = []
+            for cell in tr.find_all(["td", "th"]):
+                txt = normalize_text(cell.get_text(" ", strip=True))
+                if re.fullmatch(r"(?:1[0-8]|[1-9])", txt):
+                    numeric_cells.append(txt)
 
-            seen = set()
-            merged = []
-            for tr in horse_rows + fallback_rows:
-                marker = id(tr)
-                if marker not in seen:
-                    seen.add(marker)
-                    merged.append(tr)
-            horse_rows = merged
+            if len(numeric_cells) >= 2:
+                fallback_rows.append(tr)
+
+        seen = set()
+        merged = []
+        for tr in horse_rows + fallback_rows:
+            marker = id(tr)
+            if marker not in seen:
+                seen.add(marker)
+                merged.append(tr)
+        horse_rows = merged
 
         if not horse_rows:
             return None, (
@@ -1550,6 +1553,21 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
                     row,
                     r"Umaban",
                 )
+
+                # class名変更時の最終フォールバック。
+                # 出走馬行は通常「枠番 → 馬番 → 馬名」の順なので、
+                # 数字だけのセルから最初の2つを枠番・馬番として補完する。
+                if waku <= 0 or uma <= 0:
+                    numeric_cells = []
+                    for cell in row.find_all(["td", "th"]):
+                        txt = normalize_text(cell.get_text(" ", strip=True))
+                        if re.fullmatch(r"(?:1[0-8]|[1-9])", txt):
+                            numeric_cells.append(int(txt))
+                    if len(numeric_cells) >= 2:
+                        if waku <= 0:
+                            waku = numeric_cells[0]
+                        if uma <= 0:
+                            uma = numeric_cells[1]
 
                 if uma <= 0:
                     continue
