@@ -693,24 +693,36 @@ def extract_style_from_past_row(row) -> str:
 
 
 def find_past_row(soup, horse_number: int, horse_name: str):
+    """過去走ページから対象馬の行をclass名変更に強く探す。"""
     if soup is None:
         return None
 
-    rows = soup.find_all("tr", class_="HorseList")
+    rows = soup.find_all("tr")
+    target = normalize_text(horse_name)
 
-    # 馬番一致を最優先
+    # 1) 馬番専用class
     for row in rows:
         num = extract_number_by_class(row, r"Umaban")
         if num == horse_number:
             return row
 
-    # 馬名一致をフォールバック
-    if horse_name:
-        target = normalize_text(horse_name)
+    # 2) 馬名リンク/馬名一致
+    if target:
         for row in rows:
             name = normalize_text(extract_horse_name(row))
             if name == target:
                 return row
+            row_text = normalize_text(row.get_text(" ", strip=True))
+            if target in row_text and len(row_text) < 5000:
+                return row
+
+    # 3) 馬番と馬名のどちらかを含む行
+    for row in rows:
+        row_text = normalize_text(row.get_text(" ", strip=True))
+        num_hit = bool(re.search(rf"(?<!\d){re.escape(str(horse_number))}(?!\d)", row_text))
+        name_hit = bool(target and target in row_text)
+        if name_hit and num_hit:
+            return row
 
     return None
 
@@ -782,7 +794,7 @@ def extract_style_from_past_html_robust(
     rows = soup.find_all("tr")
     for row in rows:
         text = normalize_text(row.get_text(" ", strip=True))
-        num_hit = bool(re.search(rf"(?:^|\\s){re.escape(str(horse_number))}(?:\\s|$)", text))
+        num_hit = bool(re.search(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", text))
         name_hit = bool(target_name and target_name in text)
         if not (num_hit or name_hit):
             continue
@@ -805,7 +817,7 @@ def extract_style_from_past_html_robust(
     anchors = []
     if target_name:
         anchors.extend(m.start() for m in re.finditer(re.escape(target_name), normalize_text(raw), re.I))
-    anchors.extend(m.start() for m in re.finditer(rf"(?:^|\\s){re.escape(str(horse_number))}(?:\\s|$)", normalize_text(raw)))
+    anchors.extend(m.start() for m in re.finditer(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", normalize_text(raw)))
 
     normalized_raw = normalize_text(raw)
     for pos in anchors:
@@ -914,6 +926,54 @@ def extract_style_from_past_page(
 
     return "不明"
 
+
+
+def extract_style_from_horse_context(html: str, horse_number: int, horse_name: str) -> str:
+    """対象馬の周辺HTMLから脚質記号を拾う最終強化フォールバック。"""
+    if not html:
+        return "不明"
+    raw = normalize_text(str(html))
+    target = normalize_text(horse_name)
+    patterns = [
+        r"(?:Image)?(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)?",
+        r"(?:脚質|脚質名)[^逃先差追]{0,20}(逃|先|差|追)",
+        r"(?:runningstyle|running_style|kyakushitsu)[^逃先差追]{0,50}(逃|先|差|追)",
+    ]
+    def scan(chunk):
+        for pat in patterns:
+            m = re.search(pat, chunk, re.I)
+            if m:
+                return m.group(1)
+        return "不明"
+
+    soup = BeautifulSoup(str(html), "html.parser")
+    nodes=[]
+    if target:
+        for txt in soup.find_all(string=re.compile(re.escape(target), re.I)):
+            parent=txt.parent
+            for _ in range(8):
+                if parent is None: break
+                nodes.append(parent)
+                parent=parent.parent
+    for node in nodes:
+        chunk=str(node)
+        style=scan(normalize_text(chunk))
+        if style!="不明": return style
+        for tag in node.find_all(True):
+            vals=[tag.get("alt",""),tag.get("title",""),tag.get("aria-label","")]
+            vals += [str(v) for a,v in tag.attrs.items() if "style" in str(a).lower() or "kyaku" in str(a).lower() or "running" in str(a).lower()]
+            for val in vals:
+                style=scan(normalize_text(str(val)))
+                if style!="不明": return style
+    # 馬番周辺の生HTML
+    norm=normalize_text(str(html))
+    for needle in [str(horse_number), target]:
+        if not needle: continue
+        for m in re.finditer(re.escape(needle), norm, re.I):
+            chunk=norm[max(0,m.start()-1500):m.end()+5000]
+            style=scan(chunk)
+            if style!="不明": return style
+    return "不明"
 
 def infer_style_from_passing_order(text: str) -> str:
     """
@@ -1603,6 +1663,17 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
 
                 if style == "不明" and past_soup is not None:
                     try:
+                        context_style = extract_style_from_horse_context(
+                            str(past_soup), uma, horse_name
+                        )
+                    except Exception:
+                        context_style = "不明"
+                    if context_style != "不明":
+                        style = context_style
+                        style_source = "過去走・馬別HTML"
+
+                if style == "不明" and past_soup is not None:
+                    try:
                         inferred_style = extract_style_from_any_past_horse_text(
                             past_soup, uma, horse_name
                         )
@@ -1711,6 +1782,13 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     )
                 except Exception:
                     past_style = "不明"
+                if past_style == "不明":
+                    try:
+                        past_style = extract_style_from_horse_context(
+                            str(past_soup), num, name
+                        )
+                    except Exception:
+                        past_style = "不明"
                 if past_style != "不明":
                     horse["脚質"] = past_style
                     horse["脚質取得元"] = "過去走"
