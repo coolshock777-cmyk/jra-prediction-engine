@@ -4,4 +4,4 @@ requests
 beautifulsoup4
 numpy
 pydrive2
-oauth2client
+google-auth
