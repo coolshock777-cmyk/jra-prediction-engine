@@ -10,7 +10,83 @@ import hashlib
 from datetime import datetime
 
 # ================================================================
-# Ver.2.38 脚質最終フォールバック
+# Ver.2.39 脚質最終抽出強化
+# ================================================================
+def extract_style_from_all_attributes_v239(node) -> str:
+    """HTML属性・class・style・script文字列から脚質記号を抽出する。"""
+    if node is None:
+        return "不明"
+
+    pattern = re.compile(
+        r"(?:Image|image|脚質|kyakushitsu|running[_-]?style)?"
+        r"[^逃先差追]{0,25}(逃|先|差|追)"
+        r"(?:中\d+週|中\d+ヶ月|初出走)?",
+        re.I
+    )
+
+    def scan(value):
+        if value is None:
+            return "不明"
+        s = str(value)
+        # HTMLエンティティ等を含む場合も、そのまま正規化して検索
+        s2 = normalize_text(s)
+        for text in (s, s2):
+            m = pattern.search(text)
+            if m:
+                return m.group(1)
+            m = re.search(r"(?:逃げ|先行|差し|追込|追い込み)", text)
+            if m:
+                return {
+                    "逃げ": "逃",
+                    "先行": "先",
+                    "差し": "差",
+                    "追込": "追",
+                    "追い込み": "追",
+                }[m.group(0)]
+        return "不明"
+
+    try:
+        for tag in [node] + list(node.find_all(True)):
+            for key, value in tag.attrs.items():
+                style = scan(value)
+                if style != "不明":
+                    return style
+            style = scan(" ".join(tag.get("class", [])))
+            if style != "不明":
+                return style
+            style = scan(tag.get_text(" ", strip=True))
+            if style != "不明":
+                return style
+    except Exception:
+        pass
+
+    return "不明"
+
+
+def extract_style_from_current_race_row_v239(row) -> str:
+    """現在の出馬表の対象馬行だけから脚質を総当たり抽出。"""
+    if row is None:
+        return "不明"
+
+    style = extract_style_from_all_attributes_v239(row)
+    if style != "不明":
+        return style
+
+    # 行内のscript/json、SVG、画像URL、data属性も確認
+    try:
+        raw = str(row)
+        for chunk in (raw, normalize_text(raw)):
+            m = re.search(r"(?:逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)?", chunk)
+            if m:
+                return m.group(0)[0]
+    except Exception:
+        pass
+
+    return "不明"
+
+
+# ================================================================
+# Ver.2.39 脚質最終フォールバック
 # ================================================================
 def _final_kyakushitsu_fallback(row, horse_name="", horse_url=""):
     """
@@ -80,7 +156,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.38"
+VERSION = "Ver.2.39"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -938,7 +1014,7 @@ def extract_style_from_past_page(
     if row is None:
         return "不明"
 
-    # Ver.2.38: 対象rowの生HTML・属性を最優先で調査。
+    # Ver.2.39: 対象rowの生HTML・属性を最優先で調査。
     # 「Image先中13週」等がget_text()に出ない場合にも対応。
     raw_row_v237 = str(row)
     for pat in (
@@ -1815,9 +1891,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
 
                 if style == "不明":
                     try:
-                        detail_style = extract_style_from_horse_detail(
-                            session, row, horse_name
-                        )
+                        detail_style = extract_style_from_current_race_row_v239(row)
                     except Exception:
                         detail_style = "不明"
                     if detail_style != "不明":
@@ -1898,7 +1972,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             item.pop("_quality", None)
             horses.append(item)
 
-        # Ver.2.38: 脚質が取れていない馬だけ最終補完
+        # Ver.2.39: 脚質が取れていない馬だけ最終補完
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
             _source = str(_horse.get("脚質取得元", "") or "").strip()
@@ -1920,7 +1994,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
         if not horses:
             return None, "出走馬データの抽出件数が0件です。"
 
-        # Ver.2.38: 脚質が1頭だけ落ちるケースへの個別馬ページ補完
+        # Ver.2.39: 脚質が1頭だけ落ちるケースへの個別馬ページ補完
         # 既存の脚質取得を優先し、未取得馬だけ実行する。
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
@@ -1970,6 +2044,60 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                         "追": "追込",
                     }.get(_style2, _style2)
                     _horse["脚質取得元"] = "馬詳細・過去走"
+            except Exception:
+                pass
+
+        # Ver.2.39: 現在の出馬表rowから脚質を最終取得。
+        # 過去走側の馬番検索に失敗しても、出馬表側に脚質情報があれば復元する。
+        for _horse in horses:
+            _style = str(_horse.get("脚質", "") or "").strip()
+            if _style not in ("", "不明", "None", "nan"):
+                continue
+
+            _num = int(_horse.get("馬番", 0) or 0)
+            _name = str(_horse.get("馬名", "") or "").strip()
+
+            try:
+                _race_rows = soup.find_all("tr")
+                _found_row = None
+
+                # 馬名リンク一致を最優先
+                if _name:
+                    for _a in soup.find_all("a", href=True):
+                        _txt = normalize_text(_a.get_text(" ", strip=True))
+                        if _txt == normalize_text(_name):
+                            _found_row = _a.find_parent("tr")
+                            if _found_row is not None:
+                                break
+
+                # 馬番セル一致
+                if _found_row is None:
+                    for _r in _race_rows:
+                        for _td in _r.find_all(["td", "th"]):
+                            if normalize_text(_td.get_text(" ", strip=True)) == str(_num):
+                                _found_row = _r
+                                break
+                        if _found_row is not None:
+                            break
+
+                # 馬番＋馬名の行一致
+                if _found_row is None:
+                    for _r in _race_rows:
+                        _rt = normalize_text(_r.get_text(" ", strip=True))
+                        if str(_num) in _rt and _name and normalize_text(_name) in _rt:
+                            _found_row = _r
+                            break
+
+                _style2 = extract_style_from_current_race_row_v239(_found_row)
+                if _style2 != "不明":
+                    _horse["脚質"] = _style2
+                    _horse["脚質表示"] = {
+                        "逃": "逃げ",
+                        "先": "先行",
+                        "差": "差し",
+                        "追": "追込",
+                    }.get(_style2, _style2)
+                    _horse["脚質取得元"] = "出馬表・最終補完"
             except Exception:
                 pass
 
