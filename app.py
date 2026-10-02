@@ -94,11 +94,13 @@ def get_gdrive_service():
         # st.secrets 取得 & 辞書化
         creds_dict = dict(st.secrets["gcp_service_account"])
         
-        # 改行文字の補正処理
+        # private_key の改行コード多角補正（エスケープ文字列・実際の改行双方に対応）
         if "private_key" in creds_dict:
-            creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+            pk = creds_dict["private_key"]
+            pk = pk.replace('\\n', '\n').replace('\\\\n', '\n')
+            creds_dict["private_key"] = pk
             
-        # google-auth による現代的認証 (oauth2clientの依存・OpenSSLエラーを解消)
+        # google-auth による現代的認証処理
         from google.oauth2.service_account import Credentials
         scope = ["https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
@@ -366,74 +368,3 @@ if mode == "🏇 リアルタイム予想":
 # 5. 画面 2: 成績ダッシュボード・結果入力
 # ==========================================
 elif mode == "📊 成績ダッシュボード・結果入力":
-    st.header("📊 成績ダッシュボード & 確定回収率集計")
-    
-    df = load_history_df()
-    
-    if df.empty:
-        st.info("予想履歴データが見つかりません。")
-    else:
-        # 集計計算
-        confirmed_df = df[df["確定フラグ"] == "確定"]
-        
-        total_races = len(df)
-        confirmed_races = len(confirmed_df)
-        total_investment = confirmed_df["投資額"].astype(float).sum() if not confirmed_df.empty else 0
-        total_return = confirmed_df["回収額"].astype(float).sum() if not confirmed_df.empty else 0
-        total_balance = total_return - total_investment
-        recovery_rate = (total_return / total_investment * 100) if total_investment > 0 else 0.0
-        
-        # サマリーKPIカード
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("総予想件数", f"{total_races} 件")
-        col_m2.metric("確定レース数", f"{confirmed_races} 件")
-        col_m3.metric("通算回収率", f"{recovery_rate:.1f} %")
-        col_m4.metric("累計収支", f"{int(total_balance):,} 円")
-        
-        st.markdown("---")
-        st.subheader("📝 未確定レースの払戻金入力・更新")
-        
-        unconfirmed_df = df[df["確定フラグ"] == "未確定"]
-        
-        if unconfirmed_df.empty:
-            st.success("🎉 現在、未確定のレースはありません。すべて確定済です！")
-        else:
-            with st.form("update_result_form"):
-                selected_race_id = st.selectbox(
-                    "結果を入力するレースを選択",
-                    options=unconfirmed_df["レースID"].tolist()
-                )
-                
-                race_detail = unconfirmed_df[unconfirmed_df["レースID"] == selected_race_id].iloc[0]
-                st.caption(f"対象: **{race_detail['レース名']}** | 軸馬: **{race_detail['軸馬']}** | 投資額: **{race_detail['投資額']}円**")
-                
-                input_return = st.number_input("回収額 / 払戻金 (円)", min_value=0, value=0, step=100)
-                input_memo = st.text_input("メモ (例: 単勝的中, 馬連トリガミなど)", value="")
-                
-                submit_update = st.form_submit_button("確定成績を保存")
-                
-                if submit_update:
-                    # 対象レコードの確定保存（確定済データ保護ロジック）
-                    idx = df[df["レースID"] == selected_race_id].index
-                    if not idx.empty:
-                        inv = float(df.loc[idx[0], "投資額"])
-                        df.loc[idx[0], "確定フラグ"] = "確定"
-                        df.loc[idx[0], "回収額"] = input_return
-                        df.loc[idx[0], "収支"] = input_return - inv
-                        df.loc[idx[0], "メモ"] = input_memo
-                        
-                        if save_history_df(df):
-                            st.success(f"✅ レース `{selected_race_id}` の確定成績を更新しました！")
-                            st.rerun()
-
-        st.markdown("---")
-        st.subheader("📋 全履歴ログ")
-        st.dataframe(df, use_container_width=True)
-        
-        # CSVダウンロードボタン
-        st.download_button(
-            label="📥 最新ログ（CSV）をダウンロード",
-            data=df.to_csv(index=False, encoding="utf-8-sig"),
-            file_name=CSV_FILENAME,
-            mime="text/csv"
-        )
