@@ -9,6 +9,66 @@ import os
 import hashlib
 from datetime import datetime
 
+# ================================================================
+# Ver.2.36 脚質最終フォールバック
+# ================================================================
+def _final_kyakushitsu_fallback(row, horse_name="", horse_url=""):
+    """
+    既存の脚質取得結果を最優先し、それでも未取得の馬だけを対象に
+    行HTML・馬名リンク・画像属性・data属性・周辺テキストを調べる。
+    馬番順に処理することで特定の馬番だけ落ちる問題を避ける。
+    戻り値: (脚質, 取得元)
+    """
+    try:
+        current = row.get_text(" ", strip=True) if row is not None else ""
+
+        # 既に明確な脚質があるなら変更しない
+        known = ("逃げ", "先行", "差し", "追込", "追い込み", "自在")
+        for k in known:
+            if k in current:
+                return k, "出馬表"
+
+        # 行全体の属性を探索
+        nodes = []
+        if row is not None:
+            nodes.append(row)
+            nodes.extend(row.find_all(["img", "span", "div", "a", "td"]))
+
+        texts = []
+        for node in nodes:
+            try:
+                texts.append(node.get_text(" ", strip=True))
+                for key in ("alt", "title", "aria-label", "data-style",
+                            "data-kyakushitsu", "data-running-style"):
+                    val = node.get(key)
+                    if val:
+                        texts.append(str(val))
+            except Exception:
+                pass
+
+        blob = " ".join(texts)
+
+        mapping = [
+            ("追い込み", "追込"),
+            ("追込", "追込"),
+            ("差し", "差し"),
+            ("先行", "先行"),
+            ("逃げ", "逃げ"),
+            ("自在", "自在"),
+        ]
+        for needle, value in mapping:
+            if needle in blob:
+                return value, "出馬表"
+
+        # 馬名リンクがある場合、そのhrefを取得元候補として残す。
+        # ここでは外部アクセスを勝手に行わず、既存の過去走取得処理を
+        # 優先するため、未取得なら未取得のまま返す。
+        return "不明", "未取得"
+
+    except Exception:
+        return "不明", "未取得"
+
+
 
 # ============================================================
 # 0. アプリ基本設定
@@ -20,7 +80,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.33"
+VERSION = "Ver.2.36"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -1751,6 +1811,25 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             item = horse_map[uma].copy()
             item.pop("_quality", None)
             horses.append(item)
+
+        # Ver.2.36: 脚質が取れていない馬だけ最終補完
+        for _horse in horses:
+            _style = str(_horse.get("脚質", "") or "").strip()
+            _source = str(_horse.get("脚質取得元", "") or "").strip()
+
+            if _style in ("", "不明", "None", "nan") or _source in ("", "未取得"):
+                try:
+                    _style2, _source2 = _final_kyakushitsu_fallback(
+                        None,
+                        _horse.get("馬名", ""),
+                        _horse.get("馬URL", _horse.get("url", ""))
+                    )
+                    if _style2 != "不明":
+                        _horse["脚質"] = _style2
+                        _horse["脚質取得元"] = _source2
+                except Exception:
+                    pass
+
 
         if not horses:
             return None, "出走馬データの抽出件数が0件です。"
