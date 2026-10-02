@@ -1282,7 +1282,7 @@ REQUEST_HEADERS = {
     ttl=30,
     show_spinner=False,
 )
-def fetch_netkeiba_race_data_cached(race_id: str):
+def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
     url = (
         "https://race.netkeiba.com/race/"
         f"shutuba.html?race_id={race_id}"
