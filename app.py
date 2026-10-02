@@ -432,3 +432,8 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         
         # CSVダウンロードボタン
         st.download_button(
+            label="📥 最新ログ（CSV）をダウンロード",
+            data=df.to_csv(index=False, encoding="utf-8-sig"),
+            file_name=CSV_FILENAME,
+            mime="text/csv"
+        )
