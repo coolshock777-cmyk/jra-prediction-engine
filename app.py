@@ -34,9 +34,9 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. 定数・マスター定義 (Ver.1.10)
+# 1. 定数・マスター定義 (Ver.1.11)
 # ==========================================
-VERSION = "Ver.1.10"
+VERSION = "Ver.1.11 (前日出走表対応版)"
 
 JRA_VENUES = ["東京", "中山", "阪神", "京都", "中京", "新潟", "福島", "小倉", "札幌", "函館"]
 VENUE_CODE_MAP = {
@@ -106,7 +106,6 @@ load_history_df()
 # 2. 解析補助関数 & netkeibaスクレイピング
 # ==========================================
 def generate_jra_race_id(year: int, venue_name: str, kai: int, nichi: int, race_num: int) -> str:
-    """開催日・会場・回・日・Rからnetkeibaの12桁RaceIDを自動ビルド"""
     v_code = VENUE_CODE_MAP.get(venue_name, "05")
     return f"{year}{v_code}{kai:02d}{nichi:02d}{race_num:02d}"
 
@@ -126,7 +125,7 @@ def parse_distance_from_text(text: str) -> str:
     return "その他"
 
 def fetch_netkeiba_race_data(race_id_or_url: str):
-    """netkeibaから出走表・脚質・騎手・単勝オッズを解析"""
+    """文字化け防止 & オッズ未発表時も仮補完で正常抽出できるスクレイパー"""
     race_id_match = re.search(r'(\d{12})', race_id_or_url)
     if not race_id_match:
         return None, "有効な12桁のレースIDが見つかりません。"
@@ -141,13 +140,16 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
     try:
         res = requests.get(url, headers=headers, timeout=10)
         res.raise_for_status()
-        res.encoding = 'euc-jp'
         
-        if "RaceData01" not in res.text:
-            return None, f"レース(ID: {race_id})が見つかりませんでした。開催日・回数・日目・R番号をご確認ください。"
+        # 文字化け防止用のエンコーディング自動判定
+        if res.encoding.lower() not in ['euc-jp', 'utf-8']:
+            res.encoding = 'euc-jp'
+            
+        soup = BeautifulSoup(res.content.decode('euc-jp', 'ignore'), 'html.parser')
+        
+        if not soup.find('div', class_='RaceData01'):
+            return None, f"レース(ID: {race_id})が見つかりませんでした。開催場・回数・日目・R番号をご確認ください。"
 
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
         extracted_info = {
             "race_id": race_id,
             "track_type": "芝",
@@ -156,7 +158,8 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
             "race_num": int(race_id[-2:]),
             "condition": "良",
             "race_name": f"レース_{race_id}",
-            "race_date": datetime.now()
+            "race_date": datetime.now(),
+            "is_odds_preliminary": False
         }
         
         race_data_02 = soup.find('div', class_='RaceData02')
@@ -198,6 +201,7 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
         horses = []
         kyaku_count = 0
         front_runner_count = 0
+        preliminary_odds_count = 0
 
         for row in horse_rows:
             try:
@@ -224,6 +228,7 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
                     if "逃" in kyakushitsu or "先" in kyakushitsu:
                         front_runner_count += 1
 
+                # オッズ抽出（未確定時は10.0倍として仮設定し、エラー停止を回避）
                 odds_elem = row.find('span', class_=re.compile('Popular_Ninki|Odds'))
                 odds = None
                 if odds_elem:
@@ -235,8 +240,9 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
                             odds = None
                 
                 if odds is None or odds <= 0:
-                    return None, f"オッズが未確定（発売前）または不完全です。[対象: 馬番{umaban} {horse_name}]"
-                    
+                    odds = 10.0 # オッズ未確定（前日等）の場合は仮数値をセット
+                    preliminary_odds_count += 1
+
                 if horse_name and umaban > 0:
                     horses.append({
                         "枠番": wakuban,
@@ -252,6 +258,9 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
         if len(horses) == 0:
             return None, "出走馬データの抽出件数が0件です。"
             
+        if preliminary_odds_count > 0:
+            extracted_info["is_odds_preliminary"] = True
+
         extracted_info["horses"] = horses
         extracted_info["kyaku_count"] = kyaku_count
         extracted_info["front_runner_count"] = front_runner_count
@@ -275,7 +284,7 @@ mode = st.sidebar.radio("機能メニュー", ["🏇 リアルタイム予想", 
 # ==========================================
 if mode == "🏇 リアルタイム予想":
     st.header("🏇 リアルタイム予想 & スコアリング")
-    st.caption("※ 選択条件からRace IDを自動算出し、netkeibaから全自動で出走表・オッズを取得します。")
+    st.caption("※ 前日出走表（オッズ未確定時）でも予想計算が可能です。")
     
     # 1. 自動レース選択セクション
     st.markdown("### 📅 対象レースの選択（自動データ取得）")
@@ -308,7 +317,7 @@ if mode == "🏇 リアルタイム予想":
     # 自動データ取得ボタン
     fetched_info = None
     if st.button("🔄 出走表・最新オッズを自動読み込み"):
-        with st.spinner(f"netkeibaからレースID [{target_race_id}] のデータを全自動取得中..."):
+        with st.spinner(f"netkeibaからレースID [{target_race_id}] の出走表を自動取得中..."):
             info, err = fetch_netkeiba_race_data(target_race_id)
             if err:
                 st.error(f"❌ {err}")
@@ -319,13 +328,15 @@ if mode == "🏇 リアルタイム予想":
     if "fetched_info" in st.session_state and st.session_state["fetched_info"]:
         fetched_info = st.session_state["fetched_info"]
         kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
+        
+        odds_msg = "⚠️ オッズ未確定（前日仮数値適用中）" if fetched_info.get("is_odds_preliminary") else "✅ リアルタイムオッズ取得済"
+        
         st.success(
-            f"✅ データ一括取得成功: **{fetched_info['race_name']}** "
+            f"✅ 出走表の取得成功: **{fetched_info['race_name']}** "
             f"（{len(fetched_info['horses'])}頭 / {fetched_info['venue']}{fetched_info['race_num']}R / "
             f"{fetched_info['track_type']}{fetched_info['distance']} [{fetched_info['condition']}] / "
             f"開催日:{fetched_info['race_date'].strftime('%Y/%m/%d')}）\n\n"
-            f"💡 脚質検出 {fetched_info['kyaku_count']}/{len(fetched_info['horses'])}頭 ({kyaku_rate:.0%}) "
-            f"（逃げ・先行: {fetched_info['front_runner_count']}頭）"
+            f"💡 状態: {odds_msg} | 脚質検出 {fetched_info['kyaku_count']}/{len(fetched_info['horses'])}頭 ({kyaku_rate:.0%})"
         )
 
     # 2. コース条件・距離マスター選択
@@ -403,7 +414,7 @@ if mode == "🏇 リアルタイム予想":
             kyaku = str(h.get("脚質", ""))
 
             kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
-            if is_front_runner_bias and kyaku_rate >= 0.8 and ("逃" in kyaku or "先" in kyaku):
+            if is_front_runner_bias and ("逃" in kyaku or "先" in kyaku):
                 score += np.log(1.08)
             if is_inside_bias and (waku_num in [1, 2] if waku_num > 0 else horse_num <= 2):
                 score += np.log(1.05)
