@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime
 
 # ================================================================
-# Ver.2.37 脚質最終フォールバック
+# Ver.2.38 脚質最終フォールバック
 # ================================================================
 def _final_kyakushitsu_fallback(row, horse_name="", horse_url=""):
     """
@@ -80,7 +80,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.37"
+VERSION = "Ver.2.38"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -938,7 +938,7 @@ def extract_style_from_past_page(
     if row is None:
         return "不明"
 
-    # Ver.2.37: 対象rowの生HTML・属性を最優先で調査。
+    # Ver.2.38: 対象rowの生HTML・属性を最優先で調査。
     # 「Image先中13週」等がget_text()に出ない場合にも対応。
     raw_row_v237 = str(row)
     for pat in (
@@ -1839,6 +1839,21 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                 except Exception:
                     previous_jockey = ""
 
+                # 馬詳細URLを保持。脚質未取得馬の最終フォールバックで使用する。
+                horse_url = ""
+                try:
+                    for _a in row.find_all("a", href=True):
+                        _href = str(_a.get("href", "")).strip()
+                        if "/horse/" in _href:
+                            horse_url = _href
+                            if _href.startswith("/"):
+                                horse_url = "https://db.netkeiba.com" + _href
+                            elif _href.startswith("http"):
+                                horse_url = _href
+                            break
+                except Exception:
+                    horse_url = ""
+
                 candidate = {
                     "枠番": int(waku),
                     "馬番": int(uma),
@@ -1851,6 +1866,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     "脚質表示": style_display,
                     "脚質取得元": style_source,
                     "オッズ": odds,
+                    "馬URL": horse_url,
                 }
 
                 # 情報量の多い行を優先
@@ -1882,7 +1898,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             item.pop("_quality", None)
             horses.append(item)
 
-        # Ver.2.37: 脚質が取れていない馬だけ最終補完
+        # Ver.2.38: 脚質が取れていない馬だけ最終補完
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
             _source = str(_horse.get("脚質取得元", "") or "").strip()
@@ -1903,6 +1919,59 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
 
         if not horses:
             return None, "出走馬データの抽出件数が0件です。"
+
+        # Ver.2.38: 脚質が1頭だけ落ちるケースへの個別馬ページ補完
+        # 既存の脚質取得を優先し、未取得馬だけ実行する。
+        for _horse in horses:
+            _style = str(_horse.get("脚質", "") or "").strip()
+            if _style not in ("", "不明", "None", "nan"):
+                continue
+
+            _url = str(_horse.get("馬URL", "") or "").strip()
+            if not _url:
+                continue
+
+            try:
+                _horse_soup = None
+                _resp = session.get(
+                    _url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0 Safari/537.36"
+                        )
+                    },
+                    timeout=12,
+                )
+                _resp.raise_for_status()
+                _resp.encoding = _resp.apparent_encoding or "euc-jp"
+                _horse_soup = BeautifulSoup(_resp.text, "html.parser")
+
+                _style2 = extract_style_from_any_past_horse_text(
+                    _horse_soup,
+                    int(_horse.get("馬番", 0) or 0),
+                    str(_horse.get("馬名", "")),
+                )
+
+                if _style2 == "不明":
+                    _style2 = extract_style_from_past_page(
+                        _horse_soup,
+                        int(_horse.get("馬番", 0) or 0),
+                        str(_horse.get("馬名", "")),
+                    )
+
+                if _style2 != "不明":
+                    _horse["脚質"] = _style2
+                    _horse["脚質表示"] = {
+                        "逃": "逃げ",
+                        "先": "先行",
+                        "差": "差し",
+                        "追": "追込",
+                    }.get(_style2, _style2)
+                    _horse["脚質取得元"] = "馬詳細・過去走"
+            except Exception:
+                pass
 
         # APIオッズが取得できた場合、馬番をキーに必ず反映
         if api_odds_map:
