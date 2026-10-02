@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.13"
+VERSION = "Ver.2.14"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -439,6 +439,62 @@ def extract_odds_from_row(row):
     return None
 
 
+def extract_style_from_row(row) -> str:
+    """netkeiba出馬表の馬行から脚質を取得。画像alt/titleも解析する。"""
+    if row is None:
+        return "不明"
+
+    texts = [normalize_text(row.get_text(" ", strip=True))]
+    try:
+        texts.append(normalize_text(str(row)))
+    except Exception:
+        pass
+
+    # 脚質アイコンがimgのalt/title等に入るケース
+    for tag in row.find_all(True):
+        for attr in (
+            "alt", "title", "aria-label",
+            "data-alt", "data-title", "data-style"
+        ):
+            value = tag.get(attr)
+            if value:
+                texts.append(normalize_text(value))
+
+    # 「Image差中16週」「Image先中13週」等を優先
+    for text in texts:
+        style = extract_style_from_text(text)
+        if style != "不明":
+            return style
+
+    # 属性値そのものが脚質1文字の場合
+    for tag in row.find_all(True):
+        for attr in (
+            "alt", "title", "aria-label",
+            "data-alt", "data-title", "data-style"
+        ):
+            value = normalize_text(tag.get(attr, ""))
+            if value in {"逃", "先", "差", "追"}:
+                return value
+
+    # class / data属性内に脚質が入るケース
+    for tag in row.find_all(True):
+        class_text = " ".join(tag.get("class", []))
+        data_text = " ".join(
+            str(v) for k, v in tag.attrs.items()
+            if str(k).lower().startswith("data-")
+        )
+        combined = normalize_text(f"{class_text} {data_text}")
+        m = re.search(
+            r"(?:style|kyaku|running)[^\n]{0,40}(逃|先|差|追)",
+            combined,
+            flags=re.I,
+        )
+        if m:
+            return m.group(1)
+
+    return "不明"
+
+
 def extract_style_from_text(text: str) -> str:
     """netkeibaの「逃中2週」「先中3週」等から脚質を抽出する。"""
     text = normalize_text(text)
@@ -544,6 +600,10 @@ def extract_style_from_past_page(
 
     if row is None:
         return "不明"
+
+    direct_row_style = extract_style_from_row(row)
+    if direct_row_style != "不明":
+        return direct_row_style
 
     text = normalize_text(
         row.get_text(" ", strip=True)
@@ -1102,9 +1162,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 # 現在の出馬表の馬行から脚質を最優先で取得。
                 # netkeibaでは「Image先中13週」のように
                 # 馬行内へ現在脚質が直接記載される。
-                style = extract_style_from_text(
-                    row.get_text(" ", strip=True)
-                )
+                style = extract_style_from_row(row)
                 style_source = (
                     "出馬表・脚質欄"
                     if style != "不明"
