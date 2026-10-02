@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.01"
+VERSION = "Ver.2.02"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -327,7 +327,7 @@ def parse_distance_from_text(text: str) -> str:
 
 
 # ============================================================
-# 7. オッズ抽出（厳格判定）
+# 7. オッズ抽出（高精度判定）
 # ============================================================
 
 def parse_odds(text: str):
@@ -337,7 +337,6 @@ def parse_odds(text: str):
 
     text = str(text).strip()
 
-    # オッズは基本的に小数点を含む（例: 3.4, 12.8, 100.5）
     match = re.search(
         r"(\d+\.\d+)",
         text
@@ -360,7 +359,7 @@ def parse_odds(text: str):
 
 
 # ============================================================
-# 8. netkeibaデータ取得（斤量対応）
+# 8. netkeibaデータ取得（PC構造完全一致版）
 # ============================================================
 
 @st.cache_data(
@@ -631,20 +630,16 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
-                # 斤量 (Kinryo) 抽出
-                weight_elem = row.find(
-                    "td",
-                    class_=re.compile("Txt_C|Weight|Jockey")
-                )
-
-                # netkeibaの標準構造から斤量を正規表現で探索 (例: 57.0, 55.0)
-                row_full_text = row.get_text(" ", strip=True)
-                weight_match = re.search(r"(\d{2}\.\d)", row_full_text)
-                
-                if weight_match:
-                    kinryo = float(weight_match.group(1))
-                else:
-                    kinryo = 55.0 # fallback
+                # 斤量 (PC版HTMLの正確抽出)
+                kinryo = 55.0
+                td_elems = row.find_all("td")
+                for td in td_elems:
+                    td_txt = td.get_text(strip=True)
+                    # 例: 56.0 や 55.0 の小数点付き数値をピンポイント検出
+                    m_kin = re.match(r"^(\d{2}\.\d)$", td_txt)
+                    if m_kin:
+                        kinryo = float(m_kin.group(1))
+                        break
 
                 # 脚質
                 style_elem = row.find(
@@ -683,27 +678,26 @@ def fetch_netkeiba_race_data_cached(
 
                         front_runner_count += 1
 
-                # 厳格な単勝オッズ抽出
+                # 単勝オッズ (PC構造: Txt_R クラスや span/td からの広範探索)
                 odds = None
-
-                odds_elem = row.find(
-                    "td",
-                    class_=re.compile("Odds")
-                )
-                if not odds_elem:
-                    odds_elem = row.find(
-                        "span",
-                        class_=re.compile("Popular_Ninki|Odds")
-                    )
-
-                if odds_elem:
-
-                    odds = parse_odds(
-                        odds_elem.get_text(
-                            " ",
-                            strip=True
-                        )
-                    )
+                
+                # パターンA: 属性指定検索
+                odds_tds = row.find_all("td", class_=re.compile("Txt_R|Odds|Popular"))
+                for td in odds_tds:
+                    o_val = parse_odds(td.get_text(strip=True))
+                    if o_val is not None:
+                        odds = o_val
+                        break
+                
+                # パターンB: 全TDの中から小数点付きの数字（例: 42.6, 1.5）を探す
+                if odds is None:
+                    for td in td_elems:
+                        td_txt = td.get_text(strip=True)
+                        o_val = parse_odds(td_txt)
+                        # 斤量(56.0等)と重複しないよう排除ロジック
+                        if o_val is not None and o_val != kinryo:
+                            odds = o_val
+                            break
 
                 if odds is not None and odds >= 1.0:
 
