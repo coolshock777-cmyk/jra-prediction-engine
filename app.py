@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.19"
+VERSION = "Ver.2.25"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -1493,10 +1493,42 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
         # ----------------------------------------------------
         # 出走馬
         # ----------------------------------------------------
+        # ----------------------------------------------------
+        # 出走馬行の取得（安定版）
+        # ----------------------------------------------------
+        # netkeiba側のHTML変更や表示状態によって、tr.HorseListが
+        # 一部しか返らない場合があるため、HorseListだけに依存しない。
         horse_rows = soup.find_all(
             "tr",
-            class_="HorseList",
+            class_=re.compile(r"\bHorseList\b"),
         )
+
+        if len(horse_rows) < 4:
+            fallback_rows = []
+            for tr in soup.find_all("tr"):
+                umaban_elem = tr.find(
+                    ["td", "th"],
+                    class_=re.compile(
+                        r"Umaban|UmabanNum|UmabanCell", re.I
+                    ),
+                )
+                if umaban_elem is None:
+                    continue
+
+                umaban_text = normalize_text(
+                    umaban_elem.get_text(" ", strip=True)
+                )
+                if re.fullmatch(r"(?:1[0-8]|[1-9])", umaban_text):
+                    fallback_rows.append(tr)
+
+            seen = set()
+            merged = []
+            for tr in horse_rows + fallback_rows:
+                marker = id(tr)
+                if marker not in seen:
+                    seen.add(marker)
+                    merged.append(tr)
+            horse_rows = merged
 
         if not horse_rows:
             return None, (
