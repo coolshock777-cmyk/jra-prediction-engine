@@ -13,9 +13,7 @@ st.set_page_config(page_title="JRA AI予想 & 成績検証エンジン", page_ic
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
-# ==========================================
 # ログイン認証処理
-# ==========================================
 def check_password():
     if st.session_state["authenticated"]:
         return True
@@ -34,7 +32,7 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. 定数・距離マスター定義 (Ver.1.01)
+# 1. 定数・マスター定義
 # ==========================================
 VERSION = "Ver.1.01"
 
@@ -65,33 +63,86 @@ if "history_df" not in st.session_state:
     st.session_state["history_df"] = pd.DataFrame(columns=CSV_COLUMNS)
 
 # ==========================================
-# 2. 補助関数 (距離パース・データ保持)
+# 2. netkeiba スクレイピング関数
 # ==========================================
+def fetch_netkeiba_race_data(race_id_or_url: str):
+    """netkeibaから出走馬・騎手・オッズ・コース情報を自動取得"""
+    race_id_match = re.search(r'(\d{12})', race_url_input)
+    if not race_id_match:
+        return None, "有効な12桁のレースID（例: 202405020811）が見つかりません。"
+        
+    race_id = race_id_match.group(1)
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = 'euc-jp'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 馬情報取得
+        horse_rows = soup.find_all('tr', class_='HorseList')
+        if not horse_rows:
+            return None, "出走表データが見つかりませんでした。"
+            
+        horses = []
+        for row in horse_rows:
+            try:
+                umaban_elem = row.find('td', class_=re.compile('Umaban'))
+                umaban = int(umaban_elem.text.strip()) if umaban_elem else 0
+                
+                horse_elem = row.find('span', class_='HorseName')
+                horse_name = horse_elem.text.strip() if horse_elem else ""
+                
+                jockey_elem = row.find('td', class_='Jockey')
+                jockey = jockey_elem.text.strip() if jockey_elem else ""
+                
+                odds_elem = row.find('span', class_=re.compile('Popular_Ninki|Odds'))
+                try:
+                    odds = float(odds_elem.text.strip()) if odds_elem else 10.0
+                except:
+                    odds = 10.0
+                    
+                if horse_name:
+                    horses.append({
+                        "馬番": umaban,
+                        "馬名": horse_name,
+                        "騎手": jockey,
+                        "オッズ": odds
+                    })
+            except Exception:
+                continue
+                
+        if not horses:
+            return None, "出走馬データの解析に失敗しました。"
+            
+        return {"race_id": race_id, "horses": horses}, None
+        
+    except Exception as e:
+        return None, f"通信エラーが発生しました: {str(e)}"
+
 def parse_distance_from_text(text: str) -> str:
-    """出走表等の文字列からJRA主要距離マスターに存在する距離を返す。"""
     if not text:
         return "その他"
-    
     match = re.search(r'(\d{4}|\d{3})\s*m', text)
     if match:
         dist_str = f"{match.group(1)}m"
         if dist_str in ALL_DISTANCES:
             return dist_str
-            
     match_num = re.search(r'(\d{4}|\d{3})', text)
     if match_num:
         dist_str = f"{match_num.group(1)}m"
         if dist_str in ALL_DISTANCES:
             return dist_str
-            
     return "その他"
 
 def load_history_df():
-    """Google Drive未接続時もセッション側でデータを保持"""
     return st.session_state["history_df"]
 
 def save_history_df(df: pd.DataFrame):
-    """履歴データの保存"""
     st.session_state["history_df"] = df
     return True
 
@@ -109,36 +160,41 @@ mode = st.sidebar.radio("機能メニュー", ["🏇 リアルタイム予想", 
 if mode == "🏇 リアルタイム予想":
     st.header("🏇 リアルタイム予想 & スコアリング")
     
+    # レース入力
+    st.markdown("### 🔗 レースURL / IDの自動取得")
+    race_url_input = st.text_input(
+        "netkeiba レースURL または レースID（12桁）を入力してください",
+        placeholder="例: https://race.netkeiba.com/race/shutuba.html?race_id=202405020811"
+    )
+    
+    fetched_horses = []
+    race_id = ""
+    
+    if race_url_input:
+        with st.spinner("netkeibaから出走表・オッズデータを自動取得中..."):
+            data, err = fetch_netkeiba_race_data(race_url_input)
+            if err:
+                st.warning(f"⚠️ 自動取得スキップ (手動モード): {err}")
+            else:
+                fetched_horses = data["horses"]
+                race_id = data["race_id"]
+                st.success(f"✅ netkeibaから出走馬データ（{len(fetched_horses)}頭）を正常取得しました！ [レースID: `{race_id}`]")
+
     # 1. レース基本情報設定
     st.markdown("### 📅 レース基本情報")
     col_date, col_venue, col_rnum = st.columns(3)
     
     with col_date:
         race_date = st.date_input("開催日", pd.Timestamp.now())
-        
     with col_venue:
         selected_venue = st.selectbox("競馬場", JRA_VENUES, index=0)
-        
     with col_rnum:
         race_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
         
-    race_url_input = st.text_input(
-        "JRAレースID または レースURL（任意）",
-        placeholder="例: 202609280611 または netkeibaのURL"
-    )
-    
-    race_id_match = re.search(r'(\d{12}|\d{10})', race_url_input) if race_url_input else None
-    if race_id_match:
-        race_id = race_id_match.group(1)
-    else:
+    if not race_id:
         race_id = f"{race_date.strftime('%Y%m%d')}_{selected_venue}_{race_num}"
-        
-    st.success(f"解析対象: **{race_date.strftime('%Y/%m/%d')} {selected_venue} {race_num}** （ID: `{race_id}`）")
-    
+
     # 2. コース条件・距離マスター選択
-    parsed_extracted_text = "芝1600m"
-    default_parsed_dist = parse_distance_from_text(parsed_extracted_text)
-    
     st.markdown("### ⚙️ レース条件の確認・調整")
     col_track, col_dist, col_cond = st.columns(3)
     
@@ -152,17 +208,14 @@ if mode == "🏇 リアルタイム予想":
     else:
         dist_options = ALL_DISTANCES_WITH_OTHER
 
-    if default_parsed_dist in dist_options:
-        default_index = dist_options.index(default_parsed_dist)
-    else:
-        default_index = dist_options.index("その他")
+    default_parsed_dist = parse_distance_from_text("1600m")
+    default_index = dist_options.index(default_parsed_dist) if default_parsed_dist in dist_options else dist_options.index("その他")
 
     with col_dist:
         selected_distance = st.selectbox(
             "距離設定 (JRA主要距離)",
             options=dist_options,
-            index=default_index,
-            help="自動パースされた距離です。手動での変更も可能です。"
+            index=default_index
         )
 
     if selected_distance == "その他":
@@ -193,26 +246,30 @@ if mode == "🏇 リアルタイム予想":
 
     # 4. AI予想実行
     if st.button("🚀 AI予想を実行"):
-        sample_horses = [
-            {"馬番": 1, "馬名": "グランアレグリア", "騎手": "ルメール", "オッズ": 2.1},
-            {"馬番": 2, "馬name": "シュネルマイスター", "騎手": "横山武", "オッズ": 4.5},
-            {"馬番": 3, "馬名": "ソングライン", "騎手": "戸崎", "オッズ": 5.8},
-            {"馬番": 4, "馬名": "サリオス", "騎手": "松山", "オッズ": 12.0},
-            {"馬番": 5, "馬名": "ダノンザキッド", "騎手": "川田", "オッズ": 15.2},
+        # netkeiba自動取得データがある場合はそれを採用、無ければサンプル
+        target_horses = fetched_horses if fetched_horses else [
+            {"馬番": 1, "馬名": "サンプル1号", "騎手": "ルメール", "オッズ": 2.5},
+            {"馬番": 2, "馬名": "サンプル2号", "騎手": "川田", "オッズ": 4.0},
+            {"馬番": 3, "馬名": "サンプル3号", "騎手": "横山武", "オッズ": 6.5},
+            {"馬番": 4, "馬名": "サンプル4号", "騎手": "戸崎", "オッズ": 10.0},
+            {"馬番": 5, "馬名": "サンプル5号", "騎手": "松山", "オッズ": 18.0},
         ]
         
         scores = []
-        for h in sample_horses:
-            base_score = np.log(100.0 / h["オッズ"])
-            jockey_mult = 1.15 if h["騎手"] in ["ルメール", "川田"] else 1.0
+        for h in target_horses:
+            odds_val = float(h["オッズ"]) if float(h["オッズ"]) > 0 else 100.0
+            base_score = np.log(100.0 / odds_val)
+            jockey_mult = 1.15 if str(h.get("騎手", "")) in ["ルメール", "川田"] else 1.0
             bias_mult = 1.0
-            if is_front_runner_bias and h["馬番"] <= 3:
+            
+            horse_num = int(h["馬番"])
+            if is_front_runner_bias and horse_num <= 3:
                 bias_mult *= 1.08
-            if is_inside_bias and h["馬番"] <= 2:
+            if is_inside_bias and horse_num <= 2:
                 bias_mult *= 1.05
-            if track_type == "ダート" and final_distance == "1200m" and h["馬番"] <= 2:
+            if track_type == "ダート" and final_distance == "1200m" and horse_num <= 2:
                 bias_mult *= 1.08
-            if is_green_belt and h["馬番"] == 1:
+            if is_green_belt and horse_num == 1:
                 bias_mult *= 1.06
                 
             total_score = base_score * jockey_mult * bias_mult
@@ -222,25 +279,25 @@ if mode == "🏇 リアルタイム予想":
         model_shares = exp_scores / np.sum(exp_scores)
         
         result_rows = []
-        for idx, h in enumerate(sample_horses):
+        for idx, h in enumerate(target_horses):
             share = model_shares[idx]
-            val_index = share * h["オッズ"]
+            val_index = share * float(h["オッズ"])
             result_rows.append({
-                "馬番": h["馬番"],
-                "馬名": h["馬名"],
-                "騎手": h["騎手"],
-                "単勝オッズ": h["オッズ"],
+                "馬番": int(h["馬番"]),
+                "馬名": str(h["馬名"]),
+                "騎手": str(h.get("騎手", "")),
+                "単勝オッズ": float(h["オッズ"]),
                 "評価シェア(%)": round(share * 100, 1),
-                "AI価値指数": round(val_index, 2)
+                "モデル評価指数": round(val_index, 2)
             })
             
         res_df = pd.DataFrame(result_rows).sort_values(by="評価シェア(%)", ascending=False)
         
-        st.markdown("### 📊 予想結果・AI評価一覧")
+        st.markdown("### 📊 予想結果・モデル評価一覧")
         st.dataframe(res_df, use_container_width=True)
         
         top_horse = res_df.iloc[0]["馬名"]
-        partner_horses = ", ".join(res_df.iloc[1:3]["馬名"].tolist())
+        partner_horses = ", ".join(res_df.iloc[1:min(3, len(res_df))]["馬名"].tolist())
         top_odds = res_df.iloc[0]["単勝オッズ"]
         
         col_res1, col_res2 = st.columns(2)
