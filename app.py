@@ -2980,4 +2980,3 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         mime="text/csv",
         use_container_width=True
     )
-```
