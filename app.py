@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.07"
+VERSION = "Ver.2.10"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -527,11 +527,81 @@ def extract_style_from_past_page(
     horse_number: int,
     horse_name: str,
 ) -> str:
+    """
+    過去走ページの1頭分から複数走の脚質を集計。
+    「逃中2週」「先中3週」「差中9週」「追中11週」などを
+    全件拾い、最頻値を代表脚質として返す。
+    """
     row = find_past_row(soup, horse_number, horse_name)
+
     if row is None:
         return "不明"
 
-    return extract_style_from_past_row(row)
+    text = normalize_text(
+        row.get_text(" ", strip=True)
+    )
+
+    if not text:
+        return "不明"
+
+    styles = []
+
+    # 過去走欄の典型表記を全件取得
+    for match in re.finditer(
+        r"(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)",
+        text,
+    ):
+        styles.append(match.group(1))
+
+    # 脚質専用セルが存在する場合
+    elem = find_first_by_class(
+        row,
+        r"Kyakushitsu|RunningStyle|Style",
+    )
+
+    if elem:
+        elem_text = normalize_text(
+            elem.get_text(" ", strip=True)
+        )
+
+        for match in re.finditer(
+            r"(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)?",
+            elem_text,
+        ):
+            styles.append(match.group(1))
+
+        direct = extract_style_from_text(elem_text)
+
+        if direct != "不明":
+            styles.append(direct)
+
+    # 通常の日本語表記にも対応
+    for word, code in [
+        ("逃げ", "逃"),
+        ("先行", "先"),
+        ("差し", "差"),
+        ("追込", "追"),
+        ("追い込み", "追"),
+    ]:
+        if word in text:
+            styles.append(code)
+
+    if not styles:
+        return "不明"
+
+    counts = {}
+
+    for style in styles:
+        counts[style] = counts.get(style, 0) + 1
+
+    max_count = max(counts.values())
+
+    # 同数の場合はHTML上で先に出た脚質を採用
+    for style in styles:
+        if counts.get(style, 0) == max_count:
+            return style
+
+    return "不明"
 
 
 def extract_odds_from_past_page(
@@ -906,8 +976,9 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 if odds is None:
                     odds = extract_odds_from_row(row)
 
-                # 脚質は過去走ページの「逃中2週」等を最優先で解析。
+                # 脚質は過去走を複数走集計して代表値を決定。
                 style = "不明"
+                style_source = "未取得"
 
                 if past_soup is not None:
                     style = extract_style_from_past_page(
@@ -916,11 +987,24 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                         horse_name,
                     )
 
-                # 過去走ページで見つからない場合、現在行の全文も解析する。
+                    if style != "不明":
+                        style_source = "過去走複数走"
+
+                # 過去走で取れない場合のみ出馬表から補完
                 if style == "不明":
                     style = extract_style_from_text(
                         row.get_text(" ", strip=True)
                     )
+
+                    if style != "不明":
+                        style_source = "出馬表"
+
+                style_display = {
+                    "逃": "逃げ",
+                    "先": "先行",
+                    "差": "差し",
+                    "追": "追込",
+                }.get(style, "不明")
 
                 candidate = {
                     "枠番": int(waku),
@@ -929,6 +1013,8 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     "騎手": jockey,
                     "斤量": kinryo,
                     "脚質": style,
+                    "脚質表示": style_display,
+                    "脚質取得元": style_source,
                     "オッズ": odds,
                 }
 
@@ -1203,7 +1289,23 @@ def build_display_horse_df(horses):
                 if kinryo is not None
                 else "-"
             ),
-            "脚質": str(horse.get("脚質") or "不明"),
+            "脚質": str(
+                horse.get(
+                    "脚質表示",
+                    {
+                        "逃": "逃げ",
+                        "先": "先行",
+                        "差": "差し",
+                        "追": "追込",
+                    }.get(
+                        horse.get("脚質"),
+                        "不明",
+                    ),
+                )
+            ),
+            "脚質取得元": str(
+                horse.get("脚質取得元") or "未取得"
+            ),
             "オッズ": (
                 f"{float(odds):.1f}"
                 if odds is not None
@@ -1372,6 +1474,28 @@ if mode == "🏇 リアルタイム予想":
             "オッズ状態",
             fetched_info["odds_status"],
         )
+
+        with st.expander("🔎 脚質・オッズ取得診断"):
+            diag_df = pd.DataFrame(fetched_info["horses"])
+
+            if "脚質取得元" in diag_df.columns:
+                source_summary = (
+                    diag_df["脚質取得元"]
+                    .value_counts()
+                    .rename_axis("脚質取得元")
+                    .reset_index(name="頭数")
+                )
+
+                st.dataframe(
+                    source_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.caption(
+                "脚質は過去走の複数レースから「逃・先・差・追」を集計し、"
+                "最頻値を代表脚質として採用します。"
+            )
 
         if kyaku_rate < 0.70:
             st.warning(
