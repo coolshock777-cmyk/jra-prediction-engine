@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime
 
 # ================================================================
-# Ver.2.36 脚質最終フォールバック
+# Ver.2.37 脚質最終フォールバック
 # ================================================================
 def _final_kyakushitsu_fallback(row, horse_name="", horse_url=""):
     """
@@ -80,7 +80,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.36"
+VERSION = "Ver.2.37"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -753,36 +753,70 @@ def extract_style_from_past_row(row) -> str:
 
 
 def find_past_row(soup, horse_number: int, horse_name: str):
-    """過去走ページから対象馬の行をclass名変更に強く探す。"""
+    """過去走ページから対象馬の行を馬番・馬名・リンク情報で強力に特定する。"""
     if soup is None:
         return None
 
     rows = soup.find_all("tr")
     target = normalize_text(horse_name)
 
-    # 1) 馬番専用class
+    # 1. 専用の馬番セル
     for row in rows:
         num = extract_number_by_class(row, r"Umaban")
         if num == horse_number:
             return row
 
-    # 2) 馬名リンク/馬名一致
+    # 2. 馬名リンクを最優先。
+    # netkeibaでは同一馬名が複数箇所に出ることがあるため、
+    # /horse/ を含むリンクを優先する。
+    if target:
+        for a in soup.find_all("a", href=True):
+            href = str(a.get("href", ""))
+            txt = normalize_text(a.get_text(" ", strip=True))
+            if "/horse/" in href and txt and target == txt:
+                row = a.find_parent("tr")
+                if row is not None:
+                    return row
+
+    # 3. 馬名一致 -> 最も近いtr
+    if target:
+        for node in soup.find_all(string=re.compile(re.escape(target), re.I)):
+            parent = node.parent
+            for _ in range(8):
+                if parent is None:
+                    break
+                if getattr(parent, "name", None) == "tr":
+                    txt = normalize_text(parent.get_text(" ", strip=True))
+                    if target in txt:
+                        return parent
+                parent = parent.parent
+
+    # 4. row単位の馬名一致
     if target:
         for row in rows:
-            name = normalize_text(extract_horse_name(row))
-            if name == target:
-                return row
             row_text = normalize_text(row.get_text(" ", strip=True))
-            if target in row_text and len(row_text) < 5000:
+            if target in row_text and len(row_text) < 8000:
                 return row
 
-    # 3) 馬番と馬名のどちらかを含む行
+    # 5. 馬番 + 馬名の組合せ
     for row in rows:
         row_text = normalize_text(row.get_text(" ", strip=True))
-        num_hit = bool(re.search(rf"(?<!\d){re.escape(str(horse_number))}(?!\d)", row_text))
+        num_hit = bool(
+            re.search(
+                rf"(?<!\d){re.escape(str(horse_number))}(?!\d)",
+                row_text
+            )
+        )
         name_hit = bool(target and target in row_text)
-        if name_hit and num_hit:
+        if num_hit and name_hit:
             return row
+
+    # 6. 最後のフォールバック：馬番だけ。ただしセルの境界を厳密に確認
+    for row in rows:
+        for td in row.find_all(["td", "th"]):
+            txt = normalize_text(td.get_text(" ", strip=True))
+            if txt == str(horse_number):
+                return row
 
     return None
 
@@ -903,6 +937,42 @@ def extract_style_from_past_page(
 
     if row is None:
         return "不明"
+
+    # Ver.2.37: 対象rowの生HTML・属性を最優先で調査。
+    # 「Image先中13週」等がget_text()に出ない場合にも対応。
+    raw_row_v237 = str(row)
+    for pat in (
+        r"(?:Image)?(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)?",
+        r"(?:脚質|脚質名)[^逃先差追]{0,30}(逃|先|差|追)",
+    ):
+        mm = re.search(pat, raw_row_v237, re.I)
+        if mm:
+            return mm.group(1)
+
+    for tag in row.find_all(True):
+        vals = [
+            tag.get("alt", ""),
+            tag.get("title", ""),
+            tag.get("aria-label", ""),
+        ]
+        vals += [
+            str(v)
+            for a, v in tag.attrs.items()
+            if (
+                "style" in str(a).lower()
+                or "kyaku" in str(a).lower()
+                or "running" in str(a).lower()
+            )
+        ]
+        for val in vals:
+            sval = str(val)
+            mm = re.search(
+                r"(?:Image)?(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)?",
+                sval,
+                re.I
+            )
+            if mm:
+                return mm.group(1)
 
     # 属性値に「Image先中13週」等が入っているケースを先に確認。
     raw_row = str(row)
@@ -1812,7 +1882,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             item.pop("_quality", None)
             horses.append(item)
 
-        # Ver.2.36: 脚質が取れていない馬だけ最終補完
+        # Ver.2.37: 脚質が取れていない馬だけ最終補完
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
             _source = str(_horse.get("脚質取得元", "") or "").strip()
