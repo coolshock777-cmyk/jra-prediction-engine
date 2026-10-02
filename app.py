@@ -7,6 +7,7 @@ import json
 import numpy as np
 import os
 import hashlib
+import io
 from datetime import datetime
 
 
@@ -20,7 +21,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.14"
+VERSION = "Ver.2.17"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -389,174 +390,26 @@ def extract_jockey(row) -> str:
 
 
 def extract_trainer(row) -> str:
-    """出馬表から調教師名を取得する。"""
-    elem = find_first_by_class(
-        row,
-        r"Trainer|TrainerName|Chokyo",
-    )
-
+    """netkeiba出馬表から調教師名を取得。"""
+    elem = find_first_by_class(row, r"Trainer|TrainerName")
     if elem:
-        text = normalize_text(
-            elem.get_text(" ", strip=True)
-        )
+        text = normalize_text(elem.get_text(" ", strip=True))
         if text:
+            text = re.sub(r"^[美栗]\s*・?", "", text)
             return text
 
-    for link in row.select("a[href*='/trainer/']"):
+    for link in row.select("a[href*='/trainer/']") + row.select("a[href*='/trainer']"):
         text = normalize_text(link.get_text(" ", strip=True))
         if text:
             return text
 
-    # netkeibaのHTML変更に備え、調教師らしいセルを最後に探索
-    for td in row.find_all("td"):
-        cls = " ".join(td.get("class", []))
-        if re.search(r"Trainer|Chokyo", cls, re.I):
-            text = normalize_text(td.get_text(" ", strip=True))
-            if text:
-                return text
+    # 「美浦・杉浦」「栗東・佐々木」のようなテキストから取得
+    text = normalize_text(row.get_text(" ", strip=True))
+    m = re.search(r"(?:美浦|栗東)\s*[・/]\s*([一-龥々ぁ-んァ-ヶー]+)", text)
+    if m:
+        return m.group(1)
 
     return ""
-
-
-def normalize_person_name(name: str) -> str:
-    """騎手・調教師名の照合用正規化。"""
-    if name is None:
-        return ""
-    text = normalize_text(name)
-    text = text.replace(" ", "").replace("　", "")
-    text = text.replace("騎手", "").replace("調教師", "")
-    return text
-
-
-def extract_jockeys_from_past_row(row):
-    """過去走行に含まれる騎手リンクを新しい順に返す。"""
-    if row is None:
-        return []
-
-    names = []
-    for link in row.select("a[href*='/jockey/']"):
-        name = normalize_text(link.get_text(" ", strip=True))
-        if name:
-            names.append(name)
-
-    # リンク構造が変わった場合のフォールバック
-    if not names:
-        for tag in row.find_all(True):
-            cls = " ".join(tag.get("class", []))
-            if re.search(r"Jockey|JockeyName", cls, re.I):
-                name = normalize_text(tag.get_text(" ", strip=True))
-                if name:
-                    names.append(name)
-
-    return names
-
-
-def extract_previous_jockey(
-    past_soup,
-    horse_number: int,
-    horse_name: str,
-    current_jockey: str,
-) -> str:
-    """
-    対象馬の過去走から直近騎手を取得。
-    現在騎手と同一なら「継続騎乗」、異なれば「乗り替わり」の判定に使う。
-    """
-    if past_soup is None:
-        return ""
-
-    target_name = normalize_person_name(current_jockey)
-    row = find_past_row(
-        past_soup,
-        horse_number,
-        horse_name,
-    )
-
-    if row is None:
-        return ""
-
-    names = extract_jockeys_from_past_row(row)
-    if not names:
-        return ""
-
-    # 過去走行の最初の騎手を直近騎乗騎手として扱う。
-    for name in names:
-        if normalize_person_name(name) != normalize_person_name("未定"):
-            return name
-
-    return names[0]
-
-
-def extract_context_history(
-    past_soup,
-    horse_number: int,
-    horse_name: str,
-    jockey: str,
-    venue: str,
-    track_type: str,
-    distance: str,
-):
-    """
-    対象馬の過去走から「騎手×今回条件」の実績を補助特徴量として抽出。
-    これは騎手全体の公式集計ではなく、当該馬の過去走に限定した観測値。
-    """
-    result = {
-        "騎手×競馬場回数": 0,
-        "騎手×距離回数": 0,
-        "騎手×コース回数": 0,
-    }
-
-    if past_soup is None or not jockey:
-        return result
-
-    target_name = normalize_person_name(horse_name)
-    jockey_key = normalize_person_name(jockey)
-    venue_key = normalize_text(venue)
-    distance_key = normalize_text(distance).replace(" ", "")
-    course_key = "ダ" if track_type == "ダート" else "芝"
-
-    rows = past_soup.find_all(
-        "tr",
-        class_=re.compile(r"HorseList"),
-    )
-    if not rows:
-        rows = past_soup.find_all("tr")
-
-    for row in rows:
-        row_text = normalize_text(row.get_text(" ", strip=True))
-        if not row_text:
-            continue
-
-        num = extract_number_by_class(row, r"Umaban")
-        name_text = normalize_person_name(
-            extract_horse_name(row)
-        )
-
-        if num != horse_number and (
-            not target_name or target_name not in normalize_person_name(row_text)
-        ) and name_text != target_name:
-            continue
-
-        row_jockeys = extract_jockeys_from_past_row(row)
-        jockey_match = any(
-            normalize_person_name(x) == jockey_key
-            for x in row_jockeys
-        )
-
-        if not jockey_match and jockey_key not in normalize_person_name(row_text):
-            continue
-
-        if venue_key and venue_key in row_text:
-            result["騎手×競馬場回数"] += 1
-
-        if distance_key:
-            compact = row_text.replace(" ", "")
-            if distance_key in compact:
-                result["騎手×距離回数"] += 1
-
-        if course_key in row_text:
-            result["騎手×コース回数"] += 1
-
-    return result
 
 
 def extract_kinryo(row):
@@ -610,43 +463,84 @@ def extract_odds_from_row(row):
     return None
 
 
-def extract_style_from_text(text: str) -> str:
-    """netkeibaの「逃中2週」「先中3週」等から脚質を抽出する。"""
-    text = normalize_text(text)
+def extract_style_from_row(row) -> str:
+    """netkeiba出馬表の馬行から脚質を取得。画像alt/titleも解析する。"""
+    if row is None:
+        return "不明"
 
+    texts = [normalize_text(row.get_text(" ", strip=True))]
+    try:
+        texts.append(normalize_text(str(row)))
+    except Exception:
+        pass
+
+    # 脚質アイコンがimgのalt/title等に入るケース
+    for tag in row.find_all(True):
+        for attr in (
+            "alt", "title", "aria-label",
+            "data-alt", "data-title", "data-style"
+        ):
+            value = tag.get(attr)
+            if value:
+                texts.append(normalize_text(value))
+
+    # 「Image差中16週」「Image先中13週」等を優先
+    for text in texts:
+        style = extract_style_from_text(text)
+        if style != "不明":
+            return style
+
+    # 属性値そのものが脚質1文字の場合
+    for tag in row.find_all(True):
+        for attr in (
+            "alt", "title", "aria-label",
+            "data-alt", "data-title", "data-style"
+        ):
+            value = normalize_text(tag.get(attr, ""))
+            if value in {"逃", "先", "差", "追"}:
+                return value
+
+    # class / data属性内に脚質が入るケース
+    for tag in row.find_all(True):
+        class_text = " ".join(tag.get("class", []))
+        data_text = " ".join(
+            str(v) for k, v in tag.attrs.items()
+            if str(k).lower().startswith("data-")
+        )
+        combined = normalize_text(f"{class_text} {data_text}")
+        m = re.search(
+            r"(?:style|kyaku|running)[^\n]{0,40}(逃|先|差|追)",
+            combined,
+            flags=re.I,
+        )
+        if m:
+            return m.group(1)
+
+    return "不明"
+
+
+def extract_style_from_text(text: str) -> str:
+    """netkeibaの脚質表記を幅広く抽出する。
+
+    実ページでは「Image差中14週」のように検索結果上は見える一方、
+    HTML取得時には「差中14週」「差 中14週」「差」などに分解される
+    ケースがあるため、Imageの有無や空白を許容する。
+    """
+    text = normalize_text(text)
     if not text:
         return "不明"
 
-    # 「Image先中13週」のような連結表記を最優先。
-    match = re.search(
-        r"Image(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
-        text,
-    )
-    if match:
-        return match.group(1)
+    patterns = [
+        r"(?:Image)?\s*(逃|先|差|追)\s*(?:中\d+週|中\d+ヶ月|初出走)",
+        r"(?:脚質|style|kyaku|running)[^逃先差追]{0,30}(逃|先|差|追)",
+        r"(?<![逃先差追])(逃|先|差|追)\s*(?:中\s*\d+\s*週|中\s*\d+\s*ヶ月)",
+    ]
 
-    # 通常の脚質記号 + 休養期間
-    match = re.search(
-        r"(?:^|\s)(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
-        text,
-    )
-    if match:
-        return match.group(1)
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return m.group(1)
 
-    # 「逃中2週」のような連結文字列を直接検索
-    match = re.search(
-        r"(逃|先|差|追)中(?:\d+週|\d+ヶ月)",
-        text,
-    )
-    if match:
-        return match.group(1)
-
-    # 新馬などで「初出走」と付く場合
-    match = re.search(r"(逃|先|差|追)初出走", text)
-    if match:
-        return match.group(1)
-
-    # 説明文や別形式へのフォールバック
     if re.search(r"逃げ", text):
         return "逃"
     if re.search(r"先行", text):
@@ -682,21 +576,23 @@ def find_past_row(soup, horse_number: int, horse_name: str):
     if soup is None:
         return None
 
-    rows = soup.find_all("tr", class_="HorseList")
+    rows = soup.find_all("tr", class_=re.compile(r"HorseList", re.I))
+    if not rows:
+        rows = soup.find_all("tr")
 
-    # 馬番一致を最優先
-    for row in rows:
-        num = extract_number_by_class(row, r"Umaban")
-        if num == horse_number:
-            return row
-
-    # 馬名一致をフォールバック
+    # 馬名一致を最優先。shutuba_pastでは馬番classが変わる場合がある。
     if horse_name:
         target = normalize_text(horse_name)
         for row in rows:
-            name = normalize_text(extract_horse_name(row))
-            if name == target:
+            row_text = normalize_text(row.get_text(" ", strip=True))
+            if target and target in row_text:
                 return row
+
+    # 馬番一致
+    for row in rows:
+        num = extract_number_by_class(row, r"Umaban|HorseNumber|UmabanNo")
+        if num == horse_number:
+            return row
 
     return None
 
@@ -716,12 +612,26 @@ def extract_style_from_past_page(
     if row is None:
         return "不明"
 
+    direct_row_style = extract_style_from_row(row)
+    if direct_row_style != "不明":
+        return direct_row_style
+
     text = normalize_text(
         row.get_text(" ", strip=True)
     )
 
     if not text:
         return "不明"
+
+    # 現行netkeibaの5走/9走表示は「差中1週」「先中6週」
+    # のように馬行内へ脚質を明示するため、ここを最優先で拾う。
+    direct_matches = re.findall(
+        r"(?:^|\s)(逃|先|差|追)\s*(?:中\s*\d+\s*週|中\s*\d+\s*ヶ月|初出走)",
+        text,
+    )
+    if direct_matches:
+        counts = {x: direct_matches.count(x) for x in set(direct_matches)}
+        return max(direct_matches, key=lambda x: (counts[x], -direct_matches.index(x)))
 
     styles = []
 
@@ -1013,142 +923,226 @@ def fetch_win_odds_api(session, race_id: str):
 
 
 # ============================================================
-# 6. JRA公式リーディング取得
+# 6. JRA公式 最新リーディング取得
 # ============================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_jra_leading_data(year: int):
-    """
-    JRA公式の当年リーディング情報を取得。
-    騎手・調教師とも全国/JRA成績の順位を利用する。
-    """
-    result = {
-        "year": year,
-        "jockey": {},
-        "trainer": {},
-        "source": "JRA公式",
-    }
+JRA_LEADING_URL = "https://www.jra.go.jp/datafile/leading/"
 
-    def parse_table(soup, keywords):
-        data = {}
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if not rows:
-                continue
 
-            header_text = normalize_text(
-                rows[0].get_text(" ", strip=True)
-            )
-            if not any(k in header_text for k in keywords):
-                continue
+def normalize_person_name(value) -> str:
+    """騎手・調教師名の照合用正規化。"""
+    text = normalize_text(value)
+    text = text.replace("　", "")
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("騎手", "").replace("調教師", "")
+    return text
 
-            for row in rows[1:]:
-                cells = [
-                    normalize_text(c.get_text(" ", strip=True))
-                    for c in row.find_all(["th", "td"])
-                ]
-                if len(cells) < 2:
-                    continue
 
-                rank_match = re.search(r"^\d+$", cells[0])
-                if not rank_match:
-                    continue
+def _flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            " ".join(str(x) for x in col if str(x) != "nan").strip()
+            for col in df.columns
+        ]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-                try:
-                    rank = int(cells[0])
-                except Exception:
-                    continue
 
-                name = cells[1]
-                if not name:
-                    continue
+def _parse_leading_table(df, person_kind):
+    """JRAリーディング表から人物名→統計を抽出。"""
+    if df is None or df.empty:
+        return {}
 
-                data[normalize_person_name(name)] = {
-                    "rank": rank,
-                    "name": name,
-                    "year": year,
-                }
-        return data
+    df = _flatten_columns(df.copy())
+    cols = [str(c) for c in df.columns]
 
-    for kind, filename, keywords in [
-        (
-            "jockey",
-            f"j{year}.html",
-            ["騎手名"],
-        ),
-        (
-            "trainer",
-            f"t{year}.html",
-            ["調教師名"],
-        ),
-    ]:
-        url = (
-            "https://www.jra.go.jp/datafile/leading/"
-            f"{filename}"
-        )
-        try:
-            response = requests.get(
-                url,
-                headers=REQUEST_HEADERS,
-                timeout=20,
-            )
-            response.raise_for_status()
-            response.encoding = (
-                response.apparent_encoding
-                or response.encoding
-                or "utf-8"
-            )
-            soup = BeautifulSoup(
-                response.text,
-                "html.parser",
-            )
-            result[kind] = parse_table(
-                soup,
-                keywords,
-            )
-        except Exception:
-            result[kind] = {}
+    if person_kind == "jockey":
+        name_col = next((c for c in cols if "騎手" in c), None)
+    else:
+        name_col = next((c for c in cols if "調教師" in c), None)
 
-    # 現行年度ページが取得できない場合は前年を補助参照。
-    if not result["jockey"] and not result["trainer"] and year > 2020:
-        prev = fetch_jra_leading_data(year - 1)
-        result = prev.copy()
-        result["fallback_year"] = year - 1
+    if name_col is None:
+        # 見出しが崩れている場合は2列目を人物名候補にする
+        name_col = cols[1] if len(cols) > 1 else None
+
+    if name_col is None:
+        return {}
+
+    rank_col = next((c for c in cols if "順位" in c), None)
+    wins_col = next((c for c in cols if "1着" in c or "勝利" in c), None)
+    rides_col = next((c for c in cols if "騎乗" in c or "出走" in c), None)
+    winrate_col = next((c for c in cols if "勝率" in c), None)
+    placate_col = next((c for c in cols if "入着率" in c or "3着内率" in c), None)
+
+    result = {}
+    for _, row in df.iterrows():
+        name_raw = row.get(name_col, "")
+        name = normalize_person_name(name_raw)
+        if not name or name in {"騎手名", "調教師名"}:
+            continue
+
+        def num(col):
+            if not col:
+                return None
+            v = row.get(col)
+            if pd.isna(v):
+                return None
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", str(v).replace(",", ""))
+            return float(m.group()) if m else None
+
+        rank = num(rank_col)
+        if rank is None:
+            # 行順を順位として利用
+            rank = float(len(result) + 1)
+
+        result[name] = {
+            "rank": int(rank),
+            "wins": num(wins_col),
+            "rides": num(rides_col),
+            "win_rate": num(winrate_col),
+            "place_rate": num(placate_col),
+            "raw_name": str(name_raw),
+        }
 
     return result
 
 
-def leading_multiplier(rank):
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_latest_jra_leading():
+    """JRA公式の『最新リーディング情報』から騎手・調教師を取得。
+    年度を固定せず、JRA公式トップ→埋め込みページを順番に解析する。
     """
-    リーディング順位を過度に強くしないための緩やかな補正。
-    1位=1.10、5位前後=1.06、10位前後=1.04、20位前後=1.02。
-    """
-    if not rank:
-        return 1.0
-    if rank <= 3:
-        return 1.10
-    if rank <= 5:
-        return 1.07
-    if rank <= 10:
-        return 1.04
-    if rank <= 20:
-        return 1.02
-    if rank <= 30:
-        return 1.01
-    return 1.0
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+    }
 
+    current_year = datetime.now().year
+    urls = [JRA_LEADING_URL]
 
-def context_multiplier(count, cap=3, step=0.015):
-    """
-    当該馬の過去走から確認できる騎手×条件の回数を
-    小さな補正に変換する。最大補正は抑制する。
-    """
-    count = max(0, min(int(count or 0), cap))
-    return 1.0 + step * count
+    try:
+        r = requests.get(JRA_LEADING_URL, headers=headers, timeout=20)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding or r.encoding or "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # JRAの最新ページは表示用iframeを使う場合があるため、srcを収集。
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src")
+            if src:
+                if src.startswith("/"):
+                    src = "https://www.jra.go.jp" + src
+                elif src.startswith("http"):
+                    pass
+                else:
+                    src = "https://www.jra.go.jp/datafile/leading/" + src
+                if src not in urls:
+                    urls.append(src)
+    except Exception:
+        pass
+
+    # 年度固定ではなく、万一iframeが取れない場合のJRA公式フォールバック。
+    urls.extend([
+        f"https://www.jra.go.jp/datafile/leading/j{current_year}.html",
+        f"https://www.jra.go.jp/datafile/leading/{current_year}.html",
+    ])
+
+    jockeys = {}
+    trainers = {}
+    used_url = None
+
+    for url in urls:
+        try:
+            rr = requests.get(url, headers=headers, timeout=20)
+            rr.raise_for_status()
+            rr.encoding = rr.apparent_encoding or rr.encoding or "utf-8"
+            html = rr.text
+
+            tables = []
+            try:
+                tables = pd.read_html(io.StringIO(html))
+            except Exception:
+                tables = []
+
+            for table in tables:
+                flat = _flatten_columns(table.copy())
+                cols_text = " ".join(str(c) for c in flat.columns)
+                if "騎手" in cols_text:
+                    parsed = _parse_leading_table(flat, "jockey")
+                    if len(parsed) >= len(jockeys):
+                        jockeys = parsed
+                if "調教師" in cols_text:
+                    parsed = _parse_leading_table(flat, "trainer")
+                    if len(parsed) >= len(trainers):
+                        trainers = parsed
+
+            # pandasで見出しを拾えない場合、HTMLのtableを直接解析。
+            if not jockeys or not trainers:
+                soup2 = BeautifulSoup(html, "html.parser")
+                for table in soup2.find_all("table"):
+                    rows = []
+                    for tr in table.find_all("tr"):
+                        cells = [normalize_text(x.get_text(" ", strip=True)) for x in tr.find_all(["th", "td"])]
+                        if cells:
+                            rows.append(cells)
+                    if len(rows) < 2:
+                        continue
+                    header_text = " ".join(rows[0])
+                    if "騎手" in header_text and not jockeys:
+                        # 最低限、順位・名前を抽出
+                        for cells in rows[1:]:
+                            if len(cells) >= 2:
+                                rank_m = re.search(r"\d+", cells[0])
+                                if not rank_m:
+                                    continue
+                                name = normalize_person_name(cells[1])
+                                if name:
+                                    jockeys[name] = {"rank": int(rank_m.group()), "wins": None, "rides": None, "win_rate": None, "place_rate": None, "raw_name": cells[1]}
+                    if "調教師" in header_text and not trainers:
+                        for cells in rows[1:]:
+                            if len(cells) >= 2:
+                                rank_m = re.search(r"\d+", cells[0])
+                                if not rank_m:
+                                    continue
+                                name = normalize_person_name(cells[1])
+                                if name:
+                                    trainers[name] = {"rank": int(rank_m.group()), "wins": None, "rides": None, "win_rate": None, "place_rate": None, "raw_name": cells[1]}
+
+            if jockeys or trainers:
+                used_url = url
+                # 両方取れたURLを優先
+                if jockeys and trainers:
+                    break
+        except Exception:
+            continue
+
+    if not jockeys and not trainers:
+        return {
+            "reference_year": current_year,
+            "reference_label": f"{current_year}年・取得失敗",
+            "jockeys": {},
+            "trainers": {},
+            "source_url": JRA_LEADING_URL,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    return {
+        "reference_year": current_year,
+        "reference_label": f"{current_year}年・JRA公式 最新",
+        "jockeys": jockeys,
+        "trainers": trainers,
+        "source_url": used_url or JRA_LEADING_URL,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 # ============================================================
-# 7. netkeiba取得
+# 6. netkeiba取得
 # ============================================================
 
 REQUEST_HEADERS = {
@@ -1312,60 +1306,57 @@ def fetch_netkeiba_race_data_cached(race_id: str):
             extracted["condition"] = "良"
 
         # ----------------------------------------------------
+        # JRA公式 最新リーディング
+        # ----------------------------------------------------
+        leading_info = fetch_latest_jra_leading()
+        extracted["leading_info"] = leading_info
+
+        # ----------------------------------------------------
         # 脚質・オッズ補完用の過去走ページ
         # ----------------------------------------------------
-        past_soup = None
+        # ここは必ずこの関数内でURL一覧を生成する。
+        # Ver.2.15では past_urls の定義が抜けていたため、
+        # 出走表取得時に NameError が発生していた。
+        past_urls = [
+            (
+                "https://race.netkeiba.com/race/"
+                f"shutuba_past.html?race_id={race_id}"
+            ),
+            (
+                "https://race.netkeiba.com/race/"
+                f"shutuba_past_9.html?race_id={race_id}"
+            ),
+        ]
 
-        try:
-            past_response = session.get(
-                past_url,
-                headers={**REQUEST_HEADERS, "Referer": url},
-                timeout=20,
-            )
-            past_response.raise_for_status()
-            past_response.encoding = (
-                past_response.apparent_encoding
-                or past_response.encoding
-                or "euc-jp"
-            )
-            past_soup = BeautifulSoup(
-                past_response.text,
-                "html.parser",
-            )
+        past_soups = []
 
-            if not past_soup.find("tr"):
-                fallback_past_url = (
-                    "https://race.netkeiba.com/race/"
-                    f"shutuba_past.html?race_id={race_id}"
-                )
-                fallback_response = session.get(
-                    fallback_past_url,
+        for past_url in past_urls:
+            try:
+                past_response = session.get(
+                    past_url,
                     headers={**REQUEST_HEADERS, "Referer": url},
                     timeout=20,
                 )
-                fallback_response.raise_for_status()
-                fallback_response.encoding = (
-                    fallback_response.apparent_encoding
-                    or fallback_response.encoding
+                past_response.raise_for_status()
+                past_response.encoding = (
+                    past_response.apparent_encoding
+                    or past_response.encoding
                     or "euc-jp"
                 )
-                past_soup = BeautifulSoup(
-                    fallback_response.text,
+                candidate_soup = BeautifulSoup(
+                    past_response.text,
                     "html.parser",
                 )
-        except Exception:
-            past_soup = None
+                if candidate_soup.find("tr"):
+                    past_soups.append(candidate_soup)
+            except Exception:
+                continue
+
+        past_soup = past_soups[0] if past_soups else None
 
         # オッズはHTMLの ---.- プレースホルダではなく、
         # netkeibaの単勝オッズJSON APIから取得する。
         api_odds_map = fetch_win_odds_api(session, race_id)
-
-        # ----------------------------------------------------
-        # JRA公式リーディング
-        # ----------------------------------------------------
-        leading_data = fetch_jra_leading_data(
-            extracted["race_date"].year
-        )
 
         # ----------------------------------------------------
         # 出走馬
@@ -1407,37 +1398,6 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 jockey = extract_jockey(row)
                 trainer = extract_trainer(row)
                 kinryo = extract_kinryo(row)
-
-                jockey_rank_info = leading_data.get(
-                    "jockey", {}
-                ).get(
-                    normalize_person_name(jockey),
-                    {}
-                )
-                trainer_rank_info = leading_data.get(
-                    "trainer", {}
-                ).get(
-                    normalize_person_name(trainer),
-                    {}
-                )
-
-                previous_jockey = extract_previous_jockey(
-                    past_soup,
-                    uma,
-                    horse_name,
-                    jockey,
-                )
-
-                if previous_jockey:
-                    rider_change_status = (
-                        "継続騎乗"
-                        if normalize_person_name(previous_jockey)
-                        == normalize_person_name(jockey)
-                        else "乗り替わり"
-                    )
-                else:
-                    rider_change_status = "判定不能"
-
                 # HTML側のオッズは ---.- のプレースホルダになるため、
                 # 実値はAPIを最優先する。
                 odds = api_odds_map.get(uma)
@@ -1447,41 +1407,65 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 # 現在の出馬表の馬行から脚質を最優先で取得。
                 # netkeibaでは「Image先中13週」のように
                 # 馬行内へ現在脚質が直接記載される。
-                style = extract_style_from_text(
-                    row.get_text(" ", strip=True)
-                )
+                style = extract_style_from_row(row)
                 style_source = (
                     "出馬表・脚質欄"
                     if style != "不明"
                     else "未取得"
                 )
 
-                # 第2段階: 過去走ページの標準構造から取得。
-                if style == "不明" and past_soup is not None:
+                # 第2段階: 5走表示/9走表示の両ページを順番に確認。
+                for candidate_soup in past_soups:
+                    if style != "不明":
+                        break
+
                     past_style = extract_style_from_past_page(
-                        past_soup,
+                        candidate_soup,
                         uma,
                         horse_name,
                     )
-
                     if past_style != "不明":
                         style = past_style
-                        style_source = "過去走"
+                        style_source = "過去走・脚質表記"
 
-                # 第3段階: class名やHTML構造が変わっていても、
-                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
-                if style == "不明" and past_soup is not None:
-                    inferred_style = (
-                        extract_style_from_any_past_horse_text(
-                            past_soup,
-                            uma,
-                            horse_name,
+                # 第3段階: 馬名の前後2500文字を直接解析。
+                # netkeibaの実ページでは「Image差中14週」等が
+                # 馬名付近に表示されるため、行構造に依存しない。
+                if style == "不明":
+                    for candidate_soup in past_soups:
+                        if style != "不明":
+                            break
+                        full_text = normalize_text(
+                            candidate_soup.get_text(" ", strip=True)
                         )
-                    )
+                        target = normalize_text(horse_name)
+                        pos = full_text.find(target) if target else -1
+                        if pos >= 0:
+                            chunk = full_text[
+                                max(0, pos - 150):
+                                pos + 800
+                            ]
+                            direct = extract_style_from_text(chunk)
+                            if direct != "不明":
+                                style = direct
+                                style_source = "過去走・馬名周辺"
 
-                    if inferred_style != "不明":
-                        style = inferred_style
-                        style_source = "過去走・通過順位推定"
+                # 第4段階: class名やHTML構造が変わっていても、
+                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
+                if style == "不明":
+                    for candidate_soup in past_soups:
+                        if style != "不明":
+                            break
+                        inferred_style = (
+                            extract_style_from_any_past_horse_text(
+                                candidate_soup,
+                                uma,
+                                horse_name,
+                            )
+                        )
+                        if inferred_style != "不明":
+                            style = inferred_style
+                            style_source = "過去走・通過順位推定"
 
                 style_display = {
                     "逃": "逃げ",
@@ -1489,16 +1473,6 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     "差": "差し",
                     "追": "追込",
                 }.get(style, "不明")
-
-                context_stats = extract_context_history(
-                    past_soup=past_soup,
-                    horse_number=uma,
-                    horse_name=horse_name,
-                    jockey=jockey,
-                    venue=detected_venue,
-                    track_type=extracted["track_type"],
-                    distance=extracted["distance"],
-                )
 
                 candidate = {
                     "枠番": int(waku),
@@ -1511,13 +1485,6 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     "脚質表示": style_display,
                     "脚質取得元": style_source,
                     "オッズ": odds,
-                    "前走騎手": previous_jockey,
-                    "騎乗形態": rider_change_status,
-                    "騎手リーディング順位": jockey_rank_info.get("rank"),
-                    "調教師リーディング順位": trainer_rank_info.get("rank"),
-                    "騎手×競馬場回数": context_stats["騎手×競馬場回数"],
-                    "騎手×距離回数": context_stats["騎手×距離回数"],
-                    "騎手×コース回数": context_stats["騎手×コース回数"],
                 }
 
                 # 重複した馬番があった場合、
@@ -1599,8 +1566,6 @@ def fetch_netkeiba_race_data_cached(race_id: str):
             odds_status = "未取得（発売前等）"
 
         extracted["horses"] = horses
-        extracted["leading_data"] = leading_data
-        extracted["leading_year"] = leading_data.get("year")
         extracted["kyaku_count"] = kyaku_count
         extracted["front_runner_count"] = front_runner_count
         extracted["odds_coverage"] = odds_coverage
@@ -1644,7 +1609,6 @@ def calculate_model_score(
     outer_bias,
     green_belt,
     g1_mode,
-    jockey_trainer_mode=True,
 ):
     score = 0.0
 
@@ -1663,6 +1627,25 @@ def calculate_model_score(
         fetched_info["kyaku_count"]
         / max(total_horses, 1)
     )
+
+    # JRA公式の最新リーディングを動的に反映。
+    leading = fetched_info.get("leading_info", {}) or {}
+    jockey_stats = leading.get("jockeys", {}).get(
+        normalize_person_name(jockey)
+    )
+    trainer_name = str(horse.get("調教師", ""))
+    trainer_stats = leading.get("trainers", {}).get(
+        normalize_person_name(trainer_name)
+    )
+
+    if jockey_stats:
+        rank = jockey_stats.get("rank") or 999
+        # 上位ほど緩やかに加点し、リーディングだけで順位が決まり過ぎないようにする。
+        score += safe_log_multiplier(1.00 + max(0.0, (31 - min(rank, 30)) * 0.004))
+
+    if trainer_stats:
+        rank = trainer_stats.get("rank") or 999
+        score += safe_log_multiplier(1.00 + max(0.0, (31 - min(rank, 30)) * 0.003))
 
     if "ルメール" in jockey:
         score += safe_log_multiplier(1.15)
@@ -1700,81 +1683,6 @@ def calculate_model_score(
 
     if g1_mode and horse_num in [1, 3, 7]:
         score += safe_log_multiplier(1.03)
-
-    # --------------------------------------------------------
-    # 新規: 騎手・調教師特徴量
-    # --------------------------------------------------------
-    if jockey_trainer_mode:
-        jockey_rank = horse.get("騎手リーディング順位")
-        trainer_rank = horse.get("調教師リーディング順位")
-
-        # JRA公式当年リーディング
-        score += safe_log_multiplier(
-            leading_multiplier(jockey_rank)
-        )
-        score += safe_log_multiplier(
-            leading_multiplier(trainer_rank)
-        )
-
-        # 継続騎乗 / 乗り替わり
-        rider_status = horse.get("騎乗形態")
-        if rider_status == "継続騎乗":
-            score += safe_log_multiplier(1.04)
-        elif rider_status == "乗り替わり":
-            previous = normalize_person_name(
-                horse.get("前走騎手", "")
-            )
-            current = normalize_person_name(
-                horse.get("騎手", "")
-            )
-
-            prev_rank = (
-                fetched_info.get("leading_data", {})
-                .get("jockey", {})
-                .get(previous, {})
-                .get("rank")
-            )
-            current_rank = (
-                fetched_info.get("leading_data", {})
-                .get("jockey", {})
-                .get(current, {})
-                .get("rank")
-            )
-
-            if current_rank and prev_rank:
-                if current_rank < prev_rank:
-                    score += safe_log_multiplier(1.05)
-                elif current_rank > prev_rank:
-                    score += safe_log_multiplier(0.98)
-                else:
-                    score += safe_log_multiplier(1.00)
-            else:
-                # 前走騎手が取れない場合は、乗り替わり自体を
-                # 強いマイナスにはしない。
-                score += safe_log_multiplier(0.995)
-
-        # 騎手×競馬場 / 距離 / コース
-        score += safe_log_multiplier(
-            context_multiplier(
-                horse.get("騎手×競馬場回数", 0),
-                cap=3,
-                step=0.015,
-            )
-        )
-        score += safe_log_multiplier(
-            context_multiplier(
-                horse.get("騎手×距離回数", 0),
-                cap=3,
-                step=0.012,
-            )
-        )
-        score += safe_log_multiplier(
-            context_multiplier(
-                horse.get("騎手×コース回数", 0),
-                cap=3,
-                step=0.010,
-            )
-        )
 
     return score
 
@@ -2056,6 +1964,18 @@ if mode == "🏇 リアルタイム予想":
             fetched_info["odds_status"],
         )
 
+        leading_info = fetched_info.get("leading_info", {}) or {}
+        st.caption(
+            f"リーディング参照: {leading_info.get('reference_label', '未取得')} "
+            f"｜取得: {leading_info.get('updated_at', '-')}"
+        )
+
+        with st.expander("📊 JRA公式リーディング取得診断"):
+            st.write(f"参照: {leading_info.get('reference_label', '未取得')}")
+            st.write(f"騎手データ: {len(leading_info.get('jockeys', {}))}名")
+            st.write(f"調教師データ: {len(leading_info.get('trainers', {}))}名")
+            st.write(f"取得元: {leading_info.get('source_url', JRA_LEADING_URL)}")
+
         with st.expander("🔎 脚質・オッズ取得診断"):
             diag_df = pd.DataFrame(fetched_info["horses"])
 
@@ -2127,38 +2047,6 @@ if mode == "🏇 リアルタイム予想":
                 horse_preview,
                 use_container_width=True,
                 hide_index=True,
-            )
-
-        with st.expander("👤 騎手・調教師評価診断"):
-            diag_rows = []
-            for h in fetched_info["horses"]:
-                diag_rows.append({
-                    "馬番": h.get("馬番"),
-                    "馬名": h.get("馬名"),
-                    "騎手": h.get("騎手") or "不明",
-                    "調教師": h.get("調教師") or "不明",
-                    "騎手リーディング": h.get("騎手リーディング順位") or "-",
-                    "調教師リーディング": h.get("調教師リーディング順位") or "-",
-                    "騎乗形態": h.get("騎乗形態") or "判定不能",
-                    "前走騎手": h.get("前走騎手") or "-",
-                    "騎手×競馬場": h.get("騎手×競馬場回数", 0),
-                    "騎手×距離": h.get("騎手×距離回数", 0),
-                    "騎手×コース": h.get("騎手×コース回数", 0),
-                })
-            st.dataframe(
-                pd.DataFrame(diag_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-            leading_year = fetched_info.get("leading_year")
-            if leading_year:
-                st.caption(
-                    f"リーディング参照年: {leading_year}年 / JRA公式。"
-                    "リーディング順位が取得できない人物は補正0です。"
-                )
-            st.caption(
-                "騎手×競馬場・距離・コースは、現状では当該馬の過去走から"
-                "確認できた同騎手の出走履歴を補助特徴量として利用します。"
             )
 
     st.markdown("### ⚙️ モデル条件")
@@ -2272,15 +2160,6 @@ if mode == "🏇 リアルタイム予想":
             value=False,
         )
 
-        jockey_trainer_mode = st.checkbox(
-            "騎手・調教師評価",
-            value=True,
-            help=(
-                "JRA公式リーディング、継続騎乗/乗り替わり、"
-                "当該馬の過去走から確認できる騎手×条件をスコアへ反映します。"
-            ),
-        )
-
         confidence = st.select_slider(
             "勝負度",
             options=[
@@ -2324,7 +2203,6 @@ if mode == "🏇 リアルタイム予想":
                 outer_bias=outer_bias,
                 green_belt=green_belt,
                 g1_mode=g1_mode,
-                jockey_trainer_mode=jockey_trainer_mode,
             )
             scores.append(score)
 
@@ -2333,6 +2211,7 @@ if mode == "🏇 リアルタイム予想":
         )
 
         result_rows = []
+        leading_info = fetched_info.get("leading_info", {}) or {}
 
         for i, horse in enumerate(horses):
 
@@ -2351,26 +2230,23 @@ if mode == "🏇 リアルタイム予想":
                 "馬名": str(horse.get("馬名", "")),
                 "騎手": str(horse.get("騎手") or "不明"),
                 "調教師": str(horse.get("調教師") or "不明"),
-                "騎乗形態": str(horse.get("騎乗形態") or "判定不能"),
-                "騎手リーディング": (
-                    int(horse["騎手リーディング順位"])
-                    if horse.get("騎手リーディング順位") is not None
-                    else np.nan
+                "騎手R": (
+                    leading_info.get("jockeys", {}).get(
+                        normalize_person_name(horse.get("騎手", "")), {}
+                    ).get("rank", "-")
                 ),
-                "調教師リーディング": (
-                    int(horse["調教師リーディング順位"])
-                    if horse.get("調教師リーディング順位") is not None
-                    else np.nan
+                "調教師R": (
+                    leading_info.get("trainers", {}).get(
+                        normalize_person_name(horse.get("調教師", "")), {}
+                    ).get("rank", "-")
                 ),
-                "騎手×競馬場": int(horse.get("騎手×競馬場回数", 0) or 0),
-                "騎手×距離": int(horse.get("騎手×距離回数", 0) or 0),
-                "騎手×コース": int(horse.get("騎手×コース回数", 0) or 0),
                 "斤量": (
                     float(horse["斤量"])
                     if horse.get("斤量") is not None
                     else np.nan
                 ),
-                "脚質": str(horse.get("脚質") or "不明"),
+                "脚質": str(horse.get("脚質表示") or horse.get("脚質") or "不明"),
+                "脚質取得元": str(horse.get("脚質取得元") or "未取得"),
                 "単勝オッズ": (
                     float(odds)
                     if odds is not None
@@ -2470,6 +2346,7 @@ if mode == "🏇 リアルタイム予想":
             "bias_text": bias_text,
             "odds_status": fetched_info["odds_status"],
             "odds_coverage": fetched_info["odds_coverage"],
+            "leading_info": leading_info,
         }
 
         st.success("予想計算が完了しました。")
@@ -2485,7 +2362,6 @@ if mode == "🏇 リアルタイム予想":
         st.caption(
             "オッズ未取得の場合は「-」で表示します。"
             "脚質は通常出馬表に加えて過去走表示ページから補完します。"
-            "騎手・調教師評価はJRA公式リーディングと騎乗履歴を別特徴量として反映します。"
         )
 
         display_df = latest["result_df"].copy()
@@ -2517,6 +2393,10 @@ if mode == "🏇 リアルタイム予想":
             display_df,
             use_container_width=True,
             hide_index=True,
+        )
+
+        st.caption(
+            f"騎手・調教師評価には {leading_info.get('reference_label', '未取得')} のJRA公式リーディングを使用。"
         )
 
         r1, r2, r3 = st.columns(3)
