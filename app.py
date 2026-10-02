@@ -10,7 +10,7 @@ from datetime import datetime
 # ==========================================
 # 0. アプリ基本設定 & セッション状態
 # ==========================================
-st.set_page_config(page_title="JRA オッズ＋バイアス分析エンジン", page_icon="🏇", layout="wide")
+st.set_page_config(page_title="JRA AI予想 & 成績検証エンジン", page_icon="🏇", layout="wide")
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -34,14 +34,14 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. 定数・マスター定義 (Ver.1.09)
+# 1. 定数・マスター定義 (Ver.1.10)
 # ==========================================
-VERSION = "Ver.1.09"
+VERSION = "Ver.1.10"
 
 JRA_VENUES = ["東京", "中山", "阪神", "京都", "中京", "新潟", "福島", "小倉", "札幌", "函館"]
 VENUE_CODE_MAP = {
-    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
-    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"
+    "札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
+    "中山": "06", "中京": "07", "京都": "08", "阪神": "09", "小倉": "10"
 }
 
 TURF_DISTANCES = [
@@ -105,18 +105,10 @@ load_history_df()
 # ==========================================
 # 2. 解析補助関数 & netkeibaスクレイピング
 # ==========================================
-def parse_race_id_metadata(race_id: str):
-    if len(race_id) == 12 and race_id.isdigit():
-        year = race_id[:4]
-        venue_code = race_id[4:6]
-        r_num_str = race_id[10:12]
-        venue_name = VENUE_CODE_MAP.get(venue_code, "東京")
-        try:
-            r_num = int(r_num_str)
-        except:
-            r_num = 11
-        return year, venue_name, r_num
-    return None, None, 11
+def generate_jra_race_id(year: int, venue_name: str, kai: int, nichi: int, race_num: int) -> str:
+    """開催日・会場・回・日・Rからnetkeibaの12桁RaceIDを自動ビルド"""
+    v_code = VENUE_CODE_MAP.get(venue_name, "05")
+    return f"{year}{v_code}{kai:02d}{nichi:02d}{race_num:02d}"
 
 def parse_distance_from_text(text: str) -> str:
     if not text:
@@ -152,20 +144,19 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
         res.encoding = 'euc-jp'
         
         if "RaceData01" not in res.text:
-            return None, "レースページの取得に失敗しました（未開催またはURL無効）。"
+            return None, f"レース(ID: {race_id})が見つかりませんでした。開催日・回数・日目・R番号をご確認ください。"
 
         soup = BeautifulSoup(res.text, 'html.parser')
-        year_meta, auto_venue, auto_rnum = parse_race_id_metadata(race_id)
         
         extracted_info = {
             "race_id": race_id,
             "track_type": "芝",
             "distance": "1600m",
-            "venue": auto_venue if auto_venue else "東京",
-            "race_num": auto_rnum,
+            "venue": "東京",
+            "race_num": int(race_id[-2:]),
             "condition": "良",
             "race_name": f"レース_{race_id}",
-            "race_date": None
+            "race_date": datetime.now()
         }
         
         race_data_02 = soup.find('div', class_='RaceData02')
@@ -174,9 +165,6 @@ def fetch_netkeiba_race_data(race_id_or_url: str):
             if date_match:
                 y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
                 extracted_info["race_date"] = datetime(y, m, d)
-
-        if extracted_info["race_date"] is None:
-            return None, "開催日の自動取得に失敗しました。URLまたはレースIDを確認してください。"
 
         race_title_elem = soup.find('div', class_='RaceName')
         if race_title_elem:
@@ -287,54 +275,58 @@ mode = st.sidebar.radio("機能メニュー", ["🏇 リアルタイム予想", 
 # ==========================================
 if mode == "🏇 リアルタイム予想":
     st.header("🏇 リアルタイム予想 & スコアリング")
-    st.caption("※ 対数空間（Log-Space）によるオッズベース＋バイアス加算スコアリングモデルです。")
+    st.caption("※ 選択条件からRace IDを自動算出し、netkeibaから全自動で出走表・オッズを取得します。")
     
-    st.markdown("### 🔗 レースURL / IDの自動取得")
-    race_url_input = st.text_input(
-        "netkeiba レースURL または レースID（12桁）を入力してください",
-        placeholder="例: https://race.netkeiba.com/race/shutuba.html?race_id=202405020811"
-    )
+    # 1. 自動レース選択セクション
+    st.markdown("### 📅 対象レースの選択（自動データ取得）")
+    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
     
+    with col_d1:
+        selected_date = st.date_input("開催日", pd.Timestamp.now())
+    with col_d2:
+        selected_venue = st.selectbox("競馬場", JRA_VENUES, index=0)
+    with col_d3:
+        kai_val = st.number_input("開催回 (例: 4回中山)", min_value=1, max_value=6, value=4, step=1)
+    with col_d4:
+        nichi_val = st.number_input("日目 (例: 8日目)", min_value=1, max_value=12, value=8, step=1)
+
+    col_r1, col_r2 = st.columns([1, 2])
+    with col_r1:
+        race_num_val = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
+        r_int = int(race_num_val.replace("R", ""))
+
+    auto_generated_id = generate_jra_race_id(selected_date.year, selected_venue, kai_val, nichi_val, r_int)
+
+    with col_r2:
+        manual_url_or_id = st.text_input(
+            "または 直接URL / 12桁ID を指定（任意）",
+            placeholder=f"自動計算ID: {auto_generated_id}"
+        )
+
+    target_race_id = manual_url_or_id.strip() if manual_url_or_id.strip() else auto_generated_id
+
+    # 自動データ取得ボタン
     fetched_info = None
-    if race_url_input:
-        with st.spinner("netkeibaから出走表・コース条件・脚質・オッズを自動解析中..."):
-            info, err = fetch_netkeiba_race_data(race_url_input)
+    if st.button("🔄 出走表・最新オッズを自動読み込み"):
+        with st.spinner(f"netkeibaからレースID [{target_race_id}] のデータを全自動取得中..."):
+            info, err = fetch_netkeiba_race_data(target_race_id)
             if err:
                 st.error(f"❌ {err}")
             else:
-                fetched_info = info
-                kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
-                st.success(
-                    f"✅ 解析完了: **{fetched_info['race_name']}** "
-                    f"（{len(fetched_info['horses'])}頭 / {fetched_info['venue']}{fetched_info['race_num']}R / "
-                    f"{fetched_info['track_type']}{fetched_info['distance']} [{fetched_info['condition']}] / "
-                    f"開催日:{fetched_info['race_date'].strftime('%Y/%m/%d')}）\n\n"
-                    f"💡 データ詳細: 脚質検出 {fetched_info['kyaku_count']}/{len(fetched_info['horses'])}頭 ({kyaku_rate:.0%}) "
-                    f"（逃げ・先行: {fetched_info['front_runner_count']}頭）"
-                )
-                if kyaku_rate < 0.8:
-                    st.warning("⚠️ 脚質データの取得率が低下しています。前残りバイアスの設定にご注意ください。")
+                st.session_state["fetched_info"] = info
+                st.rerun()
 
-    # 1. レース基本情報設定
-    st.markdown("### 📅 レース基本情報")
-    col_date, col_venue, col_rnum = st.columns(3)
-    
-    default_venue_idx = 0
-    if fetched_info and fetched_info["venue"] in JRA_VENUES:
-        default_venue_idx = JRA_VENUES.index(fetched_info["venue"])
-
-    default_rnum_idx = (fetched_info["race_num"] - 1) if (fetched_info and 1 <= fetched_info["race_num"] <= 12) else 10
-    default_date_val = fetched_info["race_date"] if fetched_info else pd.Timestamp.now()
-
-    with col_date:
-        race_date = st.date_input("開催日", default_date_val)
-    with col_venue:
-        selected_venue = st.selectbox("競馬場", JRA_VENUES, index=default_venue_idx)
-    with col_rnum:
-        race_num = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=default_rnum_idx)
-        
-    race_id = fetched_info["race_id"] if fetched_info else f"{race_date.strftime('%Y%m%d')}_{selected_venue}_{race_num}"
-    race_display_name = fetched_info["race_name"] if fetched_info else f"{selected_venue}{race_num}"
+    if "fetched_info" in st.session_state and st.session_state["fetched_info"]:
+        fetched_info = st.session_state["fetched_info"]
+        kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
+        st.success(
+            f"✅ データ一括取得成功: **{fetched_info['race_name']}** "
+            f"（{len(fetched_info['horses'])}頭 / {fetched_info['venue']}{fetched_info['race_num']}R / "
+            f"{fetched_info['track_type']}{fetched_info['distance']} [{fetched_info['condition']}] / "
+            f"開催日:{fetched_info['race_date'].strftime('%Y/%m/%d')}）\n\n"
+            f"💡 脚質検出 {fetched_info['kyaku_count']}/{len(fetched_info['horses'])}頭 ({kyaku_rate:.0%}) "
+            f"（逃げ・先行: {fetched_info['front_runner_count']}頭）"
+        )
 
     # 2. コース条件・距離マスター選択
     st.markdown("### ⚙️ レース条件の確認・調整")
@@ -370,8 +362,6 @@ if mode == "🏇 リアルタイム予想":
 
     with col_cond:
         track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"], index=cond_idx)
-        
-    st.info(f"📌 設定条件: **{race_display_name}** ({selected_venue}{race_num} {track_type}{final_distance} [{track_condition}])")
     
     # 3. 補正パラメータ設定
     st.markdown("### 🎛️ 補正パラメータ設定")
@@ -390,7 +380,7 @@ if mode == "🏇 リアルタイム予想":
 
     # ガード処理
     if not fetched_info:
-        st.warning("👈 上記に netkeiba のレースURL または 12桁ID を入力してデータを読み込んでください。")
+        st.info("💡 上の「🔄 出走表・最新オッズを自動読み込み」ボタンを押して出走馬データをロードしてください。")
         run_button_disabled = True
     else:
         run_button_disabled = False
@@ -400,10 +390,9 @@ if mode == "🏇 リアルタイム予想":
         total_horses = len(target_horses)
         scores = []
         
-        # ① 対数空間 (Log-Space) での数学的加算計算モデル
         for h in target_horses:
             odds_val = float(h["オッズ"])
-            score = -np.log(odds_val) # 基本対数スコア
+            score = -np.log(odds_val)
             
             jockey_str = str(h.get("騎手", "")).replace(" ", "").replace(" ", "")
             if "ルメール" in jockey_str or "川田" in jockey_str:
@@ -413,7 +402,6 @@ if mode == "🏇 リアルタイム予想":
             waku_num = int(h.get("枠番", 0))
             kyaku = str(h.get("脚質", ""))
 
-            # 脚質・バイアス条件計算（対数空間での安全加算）
             kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
             if is_front_runner_bias and kyaku_rate >= 0.8 and ("逃" in kyaku or "先" in kyaku):
                 score += np.log(1.08)
@@ -430,7 +418,6 @@ if mode == "🏇 リアルタイム予想":
                 
             scores.append(score)
         
-        # ② ソフトマックス変換による相対シェア算出
         exp_scores = np.exp(scores - np.max(scores))
         model_shares = exp_scores / np.sum(exp_scores)
         
@@ -464,9 +451,9 @@ if mode == "🏇 リアルタイム予想":
         bias_str = ",".join(active_biases) if active_biases else "なし"
 
         st.session_state["latest_prediction"] = {
-            "race_id": race_id,
-            "race_name": race_display_name,
-            "race_date": race_date.strftime("%Y-%m-%d"),
+            "race_id": target_race_id,
+            "race_name": fetched_info["race_name"],
+            "race_date": selected_date.strftime("%Y-%m-%d"),
             "predict_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "course": f"{selected_venue}{track_type}",
             "distance": final_distance,
