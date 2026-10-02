@@ -694,6 +694,58 @@ def find_past_row(soup, horse_number: int, horse_name: str):
     return None
 
 
+def extract_style_from_past_html_robust(
+    html: str,
+    horse_number: int,
+    horse_name: str,
+) -> str:
+    """過去走ページをHTML構造に依存せず脚質抽出する最終フォールバック。"""
+    if not html:
+        return "不明"
+
+    soup = BeautifulSoup(html, "html.parser")
+    pattern = re.compile(r"(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)")
+    target_name = normalize_text(horse_name)
+
+    for row in soup.find_all("tr"):
+        text = normalize_text(row.get_text(" ", strip=True))
+        if not text:
+            continue
+        number_hit = re.search(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", text)
+        name_hit = bool(target_name and target_name in text)
+        if not (number_hit or name_hit):
+            continue
+
+        m = pattern.search(text)
+        if m:
+            return m.group(1)
+
+        for tag in row.find_all(True):
+            values = [tag.get("alt", ""), tag.get("title", ""), tag.get("aria-label", "")]
+            for attr, value in tag.attrs.items():
+                if str(attr).lower().startswith("data-"):
+                    values.append(str(value))
+            for value in values:
+                m = pattern.search(normalize_text(str(value)))
+                if m:
+                    return m.group(1)
+
+    plain = normalize_text(soup.get_text(" ", strip=True))
+    if target_name:
+        pos = plain.find(target_name)
+        if pos >= 0:
+            m = pattern.search(plain[max(0, pos-300):pos+1800])
+            if m:
+                return m.group(1)
+
+    for mpos in [m.start() for m in re.finditer(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", plain)]:
+        m = pattern.search(plain[max(0, mpos-150):mpos+1800])
+        if m:
+            return m.group(1)
+
+    return "不明"
+
+
 def extract_style_from_past_page(
     soup,
     horse_number: int,
@@ -1313,42 +1365,33 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         past_soup = None
 
         try:
-            past_response = session.get(
-                past_url,
-                headers={**REQUEST_HEADERS, "Referer": url},
-                timeout=20,
-            )
-            past_response.raise_for_status()
-            past_response.encoding = (
-                past_response.apparent_encoding
-                or past_response.encoding
-                or "euc-jp"
-            )
-            past_soup = BeautifulSoup(
-                past_response.text,
-                "html.parser",
-            )
-
-            if not past_soup.find("tr"):
-                fallback_past_url = (
-                    "https://race.netkeiba.com/race/"
-                    f"shutuba_past.html?race_id={race_id}"
-                )
-                fallback_response = session.get(
-                    fallback_past_url,
-                    headers={**REQUEST_HEADERS, "Referer": url},
-                    timeout=20,
-                )
-                fallback_response.raise_for_status()
-                fallback_response.encoding = (
-                    fallback_response.apparent_encoding
-                    or fallback_response.encoding
-                    or "euc-jp"
-                )
-                past_soup = BeautifulSoup(
-                    fallback_response.text,
-                    "html.parser",
-                )
+            past_urls = [
+                f"https://race.netkeiba.com/race/shutuba_past_9.html?race_id={race_id}",
+                f"https://race.netkeiba.com/race/shutuba_past_5.html?race_id={race_id}",
+                f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}",
+            ]
+            for candidate_url in past_urls:
+                try:
+                    past_response = session.get(
+                        candidate_url,
+                        headers={**REQUEST_HEADERS, "Referer": url},
+                        timeout=20,
+                    )
+                    past_response.raise_for_status()
+                    past_response.encoding = (
+                        past_response.apparent_encoding
+                        or past_response.encoding
+                        or "euc-jp"
+                    )
+                    candidate_soup = BeautifulSoup(past_response.text, "html.parser")
+                    candidate_text = normalize_text(candidate_soup.get_text(" ", strip=True))
+                    if candidate_soup.find("tr") and re.search(r"(逃|先|差|追)中\d+週", candidate_text):
+                        past_soup = candidate_soup
+                        break
+                    if past_soup is None and candidate_soup.find("tr"):
+                        past_soup = candidate_soup
+                except Exception:
+                    continue
         except Exception:
             past_soup = None
 
@@ -1422,6 +1465,15 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     if past_style != "不明":
                         style = past_style
                         style_source = "過去走"
+
+                # 第2.5段階: 過去走HTMLの直接解析
+                if style == "不明" and past_soup is not None:
+                    robust_style = extract_style_from_past_html_robust(
+                        str(past_soup), uma, horse_name
+                    )
+                    if robust_style != "不明":
+                        style = robust_style
+                        style_source = "過去走・脚質表記"
 
                 # 第3段階: class名やHTML構造が変わっていても、
                 # 馬名/馬番を手掛かりに過去走テキストを広く探索。
@@ -1683,7 +1735,7 @@ def classify_special_horses(result_df):
     return df, hole, danger
 
 
-def build_bet_recommendations(result_df, budget):
+def build_bet_recommendations(result_df, budget, race_context=None):
     df, hole, danger = classify_special_horses(result_df)
     df = df.sort_values("モデル確率(%)", ascending=False).reset_index(drop=True)
 
@@ -1736,8 +1788,23 @@ def build_bet_recommendations(result_df, budget):
     hole_text = f"{hole_num}番 {hole['馬名']}" if hole is not None else "なし"
     danger_text = f"{int(danger['馬番'])}番 {danger['馬名']}" if danger is not None else "なし"
 
+    race_context = race_context or {}
+    race_date = str(race_context.get("race_date") or "")
+    venue = str(race_context.get("venue") or "")
+    race_num = race_context.get("race_num")
+    race_name = str(race_context.get("race_name") or "")
+    try:
+        race_num_text = f"{int(race_num)}R" if race_num is not None else ""
+    except Exception:
+        race_num_text = str(race_num or "")
+    race_line = " ".join(x for x in [venue, race_num_text] if x)
+
     copy = "\n".join([
         "【JRA AI 推奨買い目】",
+        f"開催日：{race_date}",
+        f"レース：{race_line}",
+        f"レース名：{race_name}",
+        "",
         f"◎ {int(axis['馬番'])}番 {axis['馬名']}",
         f"○ {int(main1['馬番'])}番 {main1['馬名']}" if main1 is not None else "○ なし",
         f"▲ {int(main2['馬番'])}番 {main2['馬名']}" if main2 is not None else "▲ なし",
@@ -2317,6 +2384,7 @@ if mode == "🏇 リアルタイム予想":
                 "調教師": str(horse.get("調教師") or "不明"),
                 "斤量": float(horse["斤量"]) if horse.get("斤量") is not None else np.nan,
                 "脚質": str(horse.get("脚質") or "不明"),
+                "脚質取得元": str(horse.get("脚質取得元") or "未取得"),
                 "単勝オッズ": float(odds) if odds is not None else np.nan,
                 "モデル確率(%)": round(model_probability * 100, 2),
                 "Value Index": value_index if value_index is not None else np.nan,
@@ -2345,7 +2413,14 @@ if mode == "🏇 リアルタイム予想":
         ).reset_index(drop=True)
 
         bet_info = build_bet_recommendations(
-            result_df, budget
+            result_df,
+            budget,
+            race_context={
+                "race_date": fetched_info["race_date"].strftime("%Y/%m/%d"),
+                "venue": fetched_info["venue"],
+                "race_num": fetched_info["race_num"],
+                "race_name": fetched_info["race_name"],
+            },
         )
         result_df = bet_info["df"]
 
@@ -2654,6 +2729,9 @@ if mode == "🏇 リアルタイム予想":
                 )
 
         st.markdown("### 💰 推奨買い目")
+        st.caption(
+            f"{latest['race_date']}｜{fetched_info['venue']} {fetched_info['race_num']}R｜{latest['race_name']}"
+        )
         st.code(
             bet_info["copy_text"],
             language="text",
