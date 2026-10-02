@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.05"
+VERSION = "Ver.2.06"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -359,97 +359,7 @@ def parse_odds(text: str):
 
 
 # ============================================================
-# 8. オッズ専用ページフォールバック取得
-# ============================================================
-
-def fetch_fallback_odds_dict(race_id: str) -> dict:
-
-    odds_dict = {}
-
-    url = f"https://race.netkeiba.com/odds/index.html?type=b1&race_id={race_id}"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/120.0.0.0 "
-            "Safari/537.36"
-        )
-    }
-
-    try:
-
-        res = requests.get(url, headers=headers, timeout=10)
-
-        if res.status_code != 200:
-            return odds_dict
-
-        res.encoding = res.apparent_encoding or "euc-jp"
-
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        rows = soup.find_all("tr", id=re.compile(r"odds-td-\d+|row-\d+"))
-
-        if not rows:
-            rows = soup.find_all("tr")
-
-        for row in rows:
-
-            try:
-
-                uma_td = row.find(re.compile("td|span"), class_=re.compile("Umaban|Num"))
-
-                if not uma_td:
-                    continue
-
-                uma_txt = uma_td.get_text(strip=True)
-
-                m_uma = re.search(r"\d+", uma_txt)
-
-                if not m_uma:
-                    continue
-
-                uma_num = int(m_uma.group())
-
-                odds_td = row.find(re.compile("td|span"), id=re.compile(r"odds-1_") or class_=re.compile("Odds"))
-
-                if not odds_td:
-
-                    tds = row.find_all("td")
-
-                    for td in tds:
-
-                        val = parse_odds(td.get_text(strip=True))
-
-                        if val is not None and val >= 1.0:
-
-                            odds_dict[uma_num] = val
-
-                            break
-
-                else:
-
-                    val = parse_odds(odds_td.get_text(strip=True))
-
-                    if val is not None and val >= 1.0:
-
-                        odds_dict[uma_num] = val
-
-            except Exception:
-
-                continue
-
-    except Exception:
-
-        pass
-
-    return odds_dict
-
-
-# ============================================================
-# 8. netkeibaデータ取得（二段階自動補完版）
+# 8. netkeibaデータ取得（安定版）
 # ============================================================
 
 @st.cache_data(
@@ -762,15 +672,13 @@ def fetch_netkeiba_race_data_cached(
 
                 odds = None
 
-                odds_elem = row.find(re.compile("td|span"), id=re.compile(r"odds-\d+_\d+"))
+                odds_elem = row.find(
+                    "td",
+                    class_=re.compile("Odds")
+                )
 
                 if odds_elem:
                     odds = parse_odds(odds_elem.get_text(strip=True))
-
-                if odds is None:
-                    odds_elem = row.find(re.compile("td|span"), class_=re.compile(r"Odds"))
-                    if odds_elem:
-                        odds = parse_odds(odds_elem.get_text(strip=True))
 
                 if horse_name and uma > 0:
 
@@ -797,24 +705,10 @@ def fetch_netkeiba_race_data_cached(
 
         valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
 
-        if (valid_odds_count / len(horses)) < 0.70:
-
-            fallback_odds = fetch_fallback_odds_dict(race_id)
-
-            if fallback_odds:
-
-                for h in horses:
-
-                    uma_num = h["馬番"]
-
-                    if uma_num in fallback_odds:
-
-                        h["オッズ"] = fallback_odds[uma_num]
-
-        valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
-
         odds_coverage = (
             valid_odds_count / len(horses)
+            if len(horses) > 0
+            else 0.0
         )
 
         if odds_coverage >= 0.99:
