@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.02"
+VERSION = "Ver.2.03"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -327,7 +327,7 @@ def parse_distance_from_text(text: str) -> str:
 
 
 # ============================================================
-# 7. オッズ抽出（高精度判定）
+# 7. オッズ抽出
 # ============================================================
 
 def parse_odds(text: str):
@@ -338,7 +338,7 @@ def parse_odds(text: str):
     text = str(text).strip()
 
     match = re.search(
-        r"(\d+\.\d+)",
+        r"(\d+\.\d+|\d+)",
         text
     )
 
@@ -359,7 +359,7 @@ def parse_odds(text: str):
 
 
 # ============================================================
-# 8. netkeibaデータ取得（PC構造完全一致版）
+# 8. netkeibaデータ取得（オッズピンポイント抽出版）
 # ============================================================
 
 @st.cache_data(
@@ -630,12 +630,11 @@ def fetch_netkeiba_race_data_cached(
                     else ""
                 )
 
-                # 斤量 (PC版HTMLの正確抽出)
+                # 斤量
                 kinryo = 55.0
                 td_elems = row.find_all("td")
                 for td in td_elems:
                     td_txt = td.get_text(strip=True)
-                    # 例: 56.0 や 55.0 の小数点付き数値をピンポイント検出
                     m_kin = re.match(r"^(\d{2}\.\d)$", td_txt)
                     if m_kin:
                         kinryo = float(m_kin.group(1))
@@ -678,25 +677,27 @@ def fetch_netkeiba_race_data_cached(
 
                         front_runner_count += 1
 
-                # 単勝オッズ (PC構造: Txt_R クラスや span/td からの広範探索)
+                # オッズ（netkeibaの id="odds-1_1" 構造をピンポイント取得）
                 odds = None
                 
-                # パターンA: 属性指定検索
-                odds_tds = row.find_all("td", class_=re.compile("Txt_R|Odds|Popular"))
-                for td in odds_tds:
-                    o_val = parse_odds(td.get_text(strip=True))
-                    if o_val is not None:
-                        odds = o_val
-                        break
+                # パターン1: id属性でoddsが含まれる要素（最も確実）
+                odds_elem = row.find(re.compile("td|span"), id=re.compile(r"odds-\d+_\d+"))
+                if odds_elem:
+                    odds = parse_odds(odds_elem.get_text(strip=True))
                 
-                # パターンB: 全TDの中から小数点付きの数字（例: 42.6, 1.5）を探す
+                # パターン2: classにOddsが含まれる要素
                 if odds is None:
-                    for td in td_elems:
-                        td_txt = td.get_text(strip=True)
-                        o_val = parse_odds(td_txt)
-                        # 斤量(56.0等)と重複しないよう排除ロジック
-                        if o_val is not None and o_val != kinryo:
-                            odds = o_val
+                    odds_elem = row.find(re.compile("td|span"), class_=re.compile(r"Odds"))
+                    if odds_elem:
+                        odds = parse_odds(odds_elem.get_text(strip=True))
+
+                # パターン3: 出走表の右側にあるオッズセル（Txt_R）から直接パース
+                if odds is None:
+                    txt_r_elems = row.find_all("td", class_=re.compile("Txt_R"))
+                    for td in txt_r_elems:
+                        val = parse_odds(td.get_text(strip=True))
+                        if val is not None:
+                            odds = val
                             break
 
                 if odds is not None and odds >= 1.0:
