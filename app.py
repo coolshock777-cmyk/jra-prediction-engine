@@ -1356,7 +1356,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
             "distance": "その他",
             "condition": "良",
             "race_name": f"レース_{race_id}",
-            "race_date": datetime(race_year, 1, 1),
+            "race_date": (datetime.strptime(requested_date, "%Y-%m-%d") if requested_date else datetime(race_year, 1, 1)),
             "horses": [],
             "kyaku_count": 0,
             "front_runner_count": 0,
@@ -1398,6 +1398,14 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 if md_match:
                     m, d = map(int, md_match.groups())
                     extracted["race_date"] = datetime(race_year, m, d)
+
+        if extracted["race_date"].month == 1 and extracted["race_date"].day == 1:
+            page_text = normalize_text(soup.get_text(" ", strip=True))
+            for dm in [re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", page_text), re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", page_text)]:
+                if dm:
+                    y, m, d = map(int, dm.groups())
+                    extracted["race_date"] = datetime(y, m, d)
+                    break
 
         # ----------------------------------------------------
         # レース名
@@ -1573,6 +1581,12 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                         style = inferred_style
                         style_source = "過去走・通過順位推定"
 
+                if style == "不明":
+                    detail_style = extract_style_from_horse_detail(session, row, horse_name)
+                    if detail_style != "不明":
+                        style = detail_style
+                        style_source = "馬詳細・過去成績"
+
                 style_display = {
                     "逃": "逃げ",
                     "先": "先行",
@@ -1691,7 +1705,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         return None, f"解析エラー: {str(e)}"
 
 
-def fetch_netkeiba_race_data(race_id_or_url):
+def fetch_netkeiba_race_data(race_id_or_url, requested_date=None):
     race_id = extract_race_id(race_id_or_url)
 
     if not race_id:
@@ -1699,7 +1713,13 @@ def fetch_netkeiba_race_data(race_id_or_url):
             "有効な12桁のレースIDが見つかりません。"
         )
 
-    return fetch_netkeiba_race_data_cached(race_id)
+    requested_date_text = ""
+    if requested_date is not None:
+        try:
+            requested_date_text = pd.Timestamp(requested_date).strftime("%Y-%m-%d")
+        except Exception:
+            requested_date_text = str(requested_date)
+    return fetch_netkeiba_race_data_cached(race_id, requested_date_text)
 
 
 # ============================================================
@@ -2135,7 +2155,8 @@ if mode == "🏇 リアルタイム予想":
             f"レースID {target_race_id} を取得中..."
         ):
             info, error = fetch_netkeiba_race_data(
-                target_race_id
+                target_race_id,
+                selected_date,
             )
 
         if error:
