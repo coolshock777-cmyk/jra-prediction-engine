@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.31"
+VERSION = "Ver.2.33"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -460,24 +460,31 @@ def extract_jockey(row) -> str:
 
 
 def extract_trainer(row) -> str:
+    # 1) 調教師専用class
     elem = find_first_by_class(
         row,
-        r"Trainer|TrainerName|Chokyo",
+        r"Trainer|TrainerName|Chokyo|Tochaku",
     )
     if elem:
         text = normalize_text(elem.get_text(" ", strip=True))
+        text = re.sub(r"^(美浦|栗東)[：:]?", "", text)
         if text:
             return text
 
-    for link in row.select("a[href*='/trainer/']"):
+    # 2) trainer DBへのリンク
+    for link in row.select("a[href*='/trainer/'], a[href*='/trainerresult/']"):
         text = normalize_text(link.get_text(" ", strip=True))
         if text:
             return text
 
+    # 3) 美浦/栗東を含むセルから名前部分を抽出
     for td in row.find_all("td"):
         text = normalize_text(td.get_text(" ", strip=True))
-        if re.search(r"(美浦|栗東)", text) and len(text) <= 30:
-            return text
+        if re.search(r"(美浦|栗東)", text):
+            cleaned = re.sub(r"(美浦|栗東)", "", text).strip(" /・,，")
+            cleaned = re.sub(r"^[：:]", "", cleaned).strip()
+            if cleaned and len(cleaned) <= 30:
+                return cleaned
 
     return ""
 
@@ -1589,14 +1596,9 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                 waku_match = re.search(r"(?<!\d)([1-8])(?!\d)", waku_text)
                 waku = int(waku_match.group(1)) if waku_match else 0
 
-                # 騎手
-                jockey_elem = row.find(
-                    "td", class_=re.compile(r"Jockey", re.I)
-                )
-                jockey = (
-                    jockey_elem.get_text(" ", strip=True)
-                    if jockey_elem else ""
-                )
+                # 騎手・調教師：専用ヘルパーで取得
+                jockey = extract_jockey(row)
+                trainer = extract_trainer(row)
 
                 # 斤量
                 kinryo = 55.0
@@ -1609,37 +1611,23 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                             kinryo = val
                             break
 
-                # 脚質
-                style_elem = row.find(
-                    ["td", "span"],
-                    class_=re.compile(
-                        r"Kyakushitsu|Style|RunningStyle", re.I
-                    )
-                )
-                kyakushitsu = (
-                    style_elem.get_text(" ", strip=True)
-                    if style_elem else "不明"
-                )
-                if not kyakushitsu:
-                    kyakushitsu = "不明"
+                # 脚質：表示文字だけでなく img の alt/title/data-* も探索
+                kyakushitsu = extract_style_from_row(row)
+                style_source = "出馬表" if kyakushitsu != "不明" else ""
 
                 # オッズ
-                odds = None
-                odds_elem = row.find(
-                    "td", class_=re.compile(r"Odds", re.I)
-                )
-                if odds_elem:
-                    odds = parse_odds(
-                        odds_elem.get_text(" ", strip=True)
-                    )
+                odds = extract_odds_from_row(row)
 
                 candidate = {
                     "枠番": waku,
                     "馬番": uma,
                     "馬名": horse_name,
                     "騎手": jockey,
+                    "調教師": trainer,
                     "斤量": kinryo,
                     "脚質": kyakushitsu,
+                    "脚質取得元": style_source if style_source else "未取得",
+                    "脚質表示": {"逃":"逃げ","先":"先行","差":"差し","追":"追込"}.get(kyakushitsu, kyakushitsu),
                     "オッズ": odds,
                 }
 
@@ -1651,6 +1639,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     old_score = sum([
                         bool(old.get("馬名")),
                         bool(old.get("騎手")),
+                        bool(old.get("調教師")),
                         old.get("斤量") != 55.0,
                         old.get("脚質") != "不明",
                         old.get("オッズ") is not None,
@@ -1658,6 +1647,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     new_score = sum([
                         bool(candidate.get("馬名")),
                         bool(candidate.get("騎手")),
+                        bool(candidate.get("調教師")),
                         candidate.get("斤量") != 55.0,
                         candidate.get("脚質") != "不明",
                         candidate.get("オッズ") is not None,
@@ -1672,6 +1662,78 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             horses_by_number[n]
             for n in sorted(horses_by_number)
         ]
+
+        # ----------------------------------------------------
+        # 追加補完：調教師・前走騎手・過去走脚質
+        # ----------------------------------------------------
+        # 出馬表だけで脚質が取れないケースに備え、過去走ページを
+        # 1回だけ取得して全馬を補完する。
+        past_soup = None
+        try:
+            past_response = session.get(
+                past_url,
+                headers={**REQUEST_HEADERS, "Referer": url},
+                timeout=20,
+            )
+            if past_response.ok:
+                past_response.encoding = (
+                    past_response.apparent_encoding
+                    or past_response.encoding
+                    or "euc-jp"
+                )
+                past_soup = BeautifulSoup(
+                    past_response.text,
+                    "html.parser",
+                )
+        except Exception:
+            past_soup = None
+
+        for horse in horses:
+            num = int(horse.get("馬番", 0) or 0)
+            name = str(horse.get("馬名", ""))
+
+            # 調教師が空なら、過去走ページの同一馬行から補完
+            if not horse.get("調教師") and past_soup is not None:
+                prow = find_past_row(past_soup, num, name)
+                if prow is not None:
+                    horse["調教師"] = extract_trainer(prow)
+
+            # 現在の脚質が取れていない場合のみ過去走から補完
+            if horse.get("脚質") in (None, "", "不明") and past_soup is not None:
+                try:
+                    past_style = extract_style_from_past_page(
+                        past_soup, num, name
+                    )
+                except Exception:
+                    past_style = "不明"
+                if past_style != "不明":
+                    horse["脚質"] = past_style
+                    horse["脚質表示"] = {
+                        "逃":"逃げ", "先":"先行",
+                        "差":"差し", "追":"追込"
+                    }.get(past_style, past_style)
+                    horse["脚質取得元"] = "過去走脚質"
+
+            # 前走騎手も同時に保持。継続/乗り替わり判定に使用。
+            if past_soup is not None:
+                try:
+                    prev_jockey = extract_last_jockey_from_past_page(
+                        past_soup, num, name
+                    )
+                except Exception:
+                    prev_jockey = ""
+                horse["前走騎手"] = prev_jockey
+            else:
+                horse["前走騎手"] = horse.get("前走騎手", "")
+
+            if not horse.get("調教師"):
+                horse["調教師"] = "不明"
+            if not horse.get("脚質取得元"):
+                horse["脚質取得元"] = "未取得"
+            horse["脚質表示"] = {
+                "逃":"逃げ", "先":"先行",
+                "差":"差し", "追":"追込"
+            }.get(horse.get("脚質"), horse.get("脚質", "不明"))
 
         # 3頭だけ等の部分取得を正常データとして扱わない
         if len(horses) <= 3:
