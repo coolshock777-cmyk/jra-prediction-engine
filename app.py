@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import re
+import json
 import numpy as np
 import os
 import hashlib
@@ -438,47 +439,87 @@ def extract_odds_from_row(row):
     return None
 
 
+def extract_style_from_text(text: str) -> str:
+    """netkeibaの「逃中2週」「先中3週」等から脚質を抽出する。"""
+    text = normalize_text(text)
+
+    if not text:
+        return "不明"
+
+    # 最優先: 脚質記号 + 休養期間
+    match = re.search(
+        r"(?:^|\s|Image)(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
+        text,
+    )
+    if match:
+        return match.group(1)
+
+    # 「逃中2週」のような連結文字列を直接検索
+    match = re.search(
+        r"(逃|先|差|追)中(?:\d+週|\d+ヶ月)",
+        text,
+    )
+    if match:
+        return match.group(1)
+
+    # 新馬などで「初出走」と付く場合
+    match = re.search(r"(逃|先|差|追)初出走", text)
+    if match:
+        return match.group(1)
+
+    # 説明文や別形式へのフォールバック
+    if re.search(r"逃げ", text):
+        return "逃"
+    if re.search(r"先行", text):
+        return "先"
+    if re.search(r"差し", text):
+        return "差"
+    if re.search(r"追込|追い込み", text):
+        return "追"
+
+    return "不明"
+
+
 def extract_style_from_past_row(row) -> str:
-    # 現行のnetkeiba出馬表(過去走表示)では、
-    # 「追中11週」「差中9週」「先中3週」のように
-    # 脚質が行内に含まれる。
+    """1頭分の過去走表示行から脚質を抽出する。"""
     elem = find_first_by_class(
         row,
         r"Kyakushitsu|RunningStyle|Style",
     )
 
     if elem:
-        txt = normalize_text(
+        style = extract_style_from_text(
             elem.get_text(" ", strip=True)
         )
+        if style != "不明":
+            return style
 
-        for style in ["逃", "先", "差", "追"]:
-            if style in txt:
-                return style
-
-    row_text = normalize_text(
+    return extract_style_from_text(
         row.get_text(" ", strip=True)
     )
 
-    match = re.search(
-        r"(逃|先|差|追)(?=中\d+週|中\d+ヶ月|初出走)",
-        row_text,
-    )
 
-    if match:
-        return match.group(1)
+def find_past_row(soup, horse_number: int, horse_name: str):
+    if soup is None:
+        return None
 
-    # 「逃げ」「先行」「差し」「追込」表記にも対応
-    if "逃げ" in row_text:
-        return "逃"
-    if "先行" in row_text:
-        return "先"
-    if "差し" in row_text:
-        return "差"
-    if "追込" in row_text:
-        return "追"
+    rows = soup.find_all("tr", class_="HorseList")
 
-    return "不明"
+    # 馬番一致を最優先
+    for row in rows:
+        num = extract_number_by_class(row, r"Umaban")
+        if num == horse_number:
+            return row
+
+    # 馬名一致をフォールバック
+    if horse_name:
+        target = normalize_text(horse_name)
+        for row in rows:
+            name = normalize_text(extract_horse_name(row))
+            if name == target:
+                return row
+
+    return None
 
 
 def extract_style_from_past_page(
@@ -486,34 +527,11 @@ def extract_style_from_past_page(
     horse_number: int,
     horse_name: str,
 ) -> str:
-    rows = soup.find_all(
-        "tr",
-        class_="HorseList",
-    )
-
-    best_row = None
-
-    for row in rows:
-        num = extract_number_by_class(
-            row,
-            r"Umaban",
-        )
-
-        if num == horse_number:
-            best_row = row
-            break
-
-    if best_row is None and horse_name:
-        for row in rows:
-            name = extract_horse_name(row)
-            if name == horse_name:
-                best_row = row
-                break
-
-    if best_row is None:
+    row = find_past_row(soup, horse_number, horse_name)
+    if row is None:
         return "不明"
 
-    return extract_style_from_past_row(best_row)
+    return extract_style_from_past_row(row)
 
 
 def extract_odds_from_past_page(
@@ -521,33 +539,113 @@ def extract_odds_from_past_page(
     horse_number: int,
     horse_name: str,
 ):
-    rows = soup.find_all(
-        "tr",
-        class_="HorseList",
-    )
-
-    best_row = None
-
-    for row in rows:
-        num = extract_number_by_class(
-            row,
-            r"Umaban",
-        )
-
-        if num == horse_number:
-            best_row = row
-            break
-
-    if best_row is None and horse_name:
-        for row in rows:
-            if extract_horse_name(row) == horse_name:
-                best_row = row
-                break
-
-    if best_row is None:
+    row = find_past_row(soup, horse_number, horse_name)
+    if row is None:
         return None
 
-    return extract_odds_from_row(best_row)
+    return extract_odds_from_row(row)
+
+
+def parse_odds_api_payload(response_text: str):
+    """netkeibaオッズAPIのJSON/JSONPを辞書へ変換する。"""
+    text = (response_text or "").strip()
+    if not text:
+        return None
+
+    # JSONP: callback({...}); / xxx({...}); を許容
+    candidates = [text]
+    match = re.search(r"\((\{.*\})\)\s*;?\s*$", text, re.S)
+    if match:
+        candidates.append(match.group(1))
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+
+    return None
+
+
+def fetch_win_odds_api(session, race_id: str):
+    """netkeibaの単勝オッズAPIから馬番別オッズを取得する。"""
+    api_url = (
+        "https://race.netkeiba.com/api/api_get_jra_odds.html"
+    )
+
+    params = {
+        "pid": "api_get_jra_odds",
+        "race_id": race_id,
+        "type": "1",
+        "action": "update",
+        "sort": "odds",
+        "compress": "0",
+        "output": "json",
+    }
+
+    headers = dict(REQUEST_HEADERS)
+    headers.update({
+        "Referer": (
+            "https://race.netkeiba.com/race/"
+            f"shutuba.html?race_id={race_id}"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    })
+
+    try:
+        response = session.get(
+            api_url,
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
+        response.raise_for_status()
+
+        payload = parse_odds_api_payload(response.text)
+
+        # updateで空の場合はinitでもう一度取得する。
+        if not payload:
+            params["action"] = "init"
+            retry = session.get(
+                api_url,
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            retry.raise_for_status()
+            payload = parse_odds_api_payload(retry.text)
+
+        if not payload:
+            return {}
+
+        data = payload.get("data", payload)
+        odds_root = data.get("odds", {}) if isinstance(data, dict) else {}
+        win_rows = odds_root.get("1", {}) if isinstance(odds_root, dict) else {}
+
+        result = {}
+
+        if isinstance(win_rows, dict):
+            for key, row in win_rows.items():
+                try:
+                    horse_no = int(str(key))
+                except Exception:
+                    continue
+
+                odds = None
+                if isinstance(row, (list, tuple)) and len(row) > 0:
+                    odds = parse_odds(row[0])
+                else:
+                    odds = parse_odds(row)
+
+                if odds is not None:
+                    result[horse_no] = odds
+
+        return result
+
+    except Exception:
+        return {}
 
 
 # ============================================================
@@ -583,9 +681,12 @@ def fetch_netkeiba_race_data_cached(race_id: str):
     )
 
     try:
-        response = requests.get(
+        session = requests.Session()
+        session.headers.update(REQUEST_HEADERS)
+
+        response = session.get(
             url,
-            headers=REQUEST_HEADERS,
+            headers={**REQUEST_HEADERS, "Referer": "https://race.netkeiba.com/"},
             timeout=20,
         )
 
@@ -717,9 +818,9 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         past_soup = None
 
         try:
-            past_response = requests.get(
+            past_response = session.get(
                 past_url,
-                headers=REQUEST_HEADERS,
+                headers={**REQUEST_HEADERS, "Referer": url},
                 timeout=20,
             )
             past_response.raise_for_status()
@@ -732,8 +833,33 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 past_response.text,
                 "html.parser",
             )
+
+            if not past_soup.find_all("tr", class_="HorseList"):
+                fallback_past_url = (
+                    "https://race.netkeiba.com/race/"
+                    f"shutuba_past.html?race_id={race_id}"
+                )
+                fallback_response = session.get(
+                    fallback_past_url,
+                    headers={**REQUEST_HEADERS, "Referer": url},
+                    timeout=20,
+                )
+                fallback_response.raise_for_status()
+                fallback_response.encoding = (
+                    fallback_response.apparent_encoding
+                    or fallback_response.encoding
+                    or "euc-jp"
+                )
+                past_soup = BeautifulSoup(
+                    fallback_response.text,
+                    "html.parser",
+                )
         except Exception:
             past_soup = None
+
+        # オッズはHTMLの ---.- プレースホルダではなく、
+        # netkeibaの単勝オッズJSON APIから取得する。
+        api_odds_map = fetch_win_odds_api(session, race_id)
 
         # ----------------------------------------------------
         # 出走馬
@@ -774,10 +900,13 @@ def fetch_netkeiba_race_data_cached(race_id: str):
 
                 jockey = extract_jockey(row)
                 kinryo = extract_kinryo(row)
-                odds = extract_odds_from_row(row)
+                # HTML側のオッズは ---.- のプレースホルダになるため、
+                # 実値はAPIを最優先する。
+                odds = api_odds_map.get(uma)
+                if odds is None:
+                    odds = extract_odds_from_row(row)
 
-                # 脚質は通常の出馬表で取れない場合があるため、
-                # 過去走表示ページから補完する。
+                # 脚質は過去走ページの「逃中2週」等を最優先で解析。
                 style = "不明"
 
                 if past_soup is not None:
@@ -787,12 +916,10 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                         horse_name,
                     )
 
-                # オッズも過去走ページをフォールバックにする。
-                if odds is None and past_soup is not None:
-                    odds = extract_odds_from_past_page(
-                        past_soup,
-                        uma,
-                        horse_name,
+                # 過去走ページで見つからない場合、現在行の全文も解析する。
+                if style == "不明":
+                    style = extract_style_from_text(
+                        row.get_text(" ", strip=True)
                     )
 
                 candidate = {
