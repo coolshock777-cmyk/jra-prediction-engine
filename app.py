@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.11"
+VERSION = "Ver.2.12"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -612,6 +612,121 @@ def extract_style_from_past_page(
     return "不明"
 
 
+def infer_style_from_passing_order(text: str) -> str:
+    """
+    過去走の「通過」順位から脚質を推定する最終フォールバック。
+    例: 1-1-1-1 / 2-3-4-5 / 10-10-9-8
+    """
+    text = normalize_text(text)
+    if not text:
+        return "不明"
+
+    # 明示的な脚質表記があれば最優先
+    explicit = extract_style_from_text(text)
+    if explicit != "不明":
+        return explicit
+
+    patterns = [
+        r"通過(?:順位)?[^0-9]{0,10}([0-9]+(?:[-－][0-9]+){1,3})",
+        r"通過[^0-9]{0,10}([0-9]+(?:,[0-9]+){1,3})",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if not m:
+            continue
+
+        raw = m.group(1).replace("－", "-").replace(",", "-")
+        try:
+            positions = [
+                int(x) for x in raw.split("-")
+                if x.isdigit()
+            ]
+        except Exception:
+            continue
+
+        if not positions:
+            continue
+
+        # 最終コーナー寄りの位置を代表値にする
+        pos = positions[-1]
+
+        # 1～3番手は逃げ/先行寄り
+        if pos <= 2:
+            return "逃"
+        if pos <= 5:
+            return "先"
+
+        # それ以降は差し/追込
+        if pos <= 10:
+            return "差"
+
+        return "追"
+
+    return "不明"
+
+
+def extract_style_from_any_past_horse_text(
+    soup,
+    horse_number: int,
+    horse_name: str,
+) -> str:
+    """
+    HorseListのclass名が変わっても、馬番・馬名を手掛かりに
+    過去走ページ全体から対象馬のテキストを探す。
+    """
+    if soup is None:
+        return "不明"
+
+    target_name = normalize_text(horse_name)
+
+    # まずHorseList
+    rows = soup.find_all("tr", class_=re.compile(r"HorseList"))
+    candidates = list(rows)
+
+    # HorseListが取れない場合はtable内のtrを広く探索
+    if not candidates:
+        candidates = soup.find_all("tr")
+
+    matched = []
+
+    for row in candidates:
+        text = normalize_text(row.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        if target_name and target_name in text:
+            matched.append(text)
+            continue
+
+        num = extract_number_by_class(row, r"Umaban")
+        if num == horse_number:
+            matched.append(text)
+
+    # 対象馬の行をまとめて解析
+    for text in matched:
+        style = infer_style_from_passing_order(text)
+        if style != "不明":
+            return style
+
+    # 行構造が取れない場合、ページ内の対象馬名周辺を直接探索
+    if target_name:
+        full_text = normalize_text(soup.get_text(" ", strip=True))
+        start = full_text.find(target_name)
+
+        if start >= 0:
+            chunk = full_text[
+                max(0, start - 500):
+                start + 2500
+            ]
+            style = infer_style_from_passing_order(chunk)
+            if style != "不明":
+                return style
+
+    return "不明"
+
+
+
 def extract_odds_from_past_page(
     soup,
     horse_number: int,
@@ -912,7 +1027,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 "html.parser",
             )
 
-            if not past_soup.find_all("tr", class_="HorseList"):
+            if not past_soup.find("tr"):
                 fallback_past_url = (
                     "https://race.netkeiba.com/race/"
                     f"shutuba_past.html?race_id={race_id}"
@@ -996,7 +1111,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     else "未取得"
                 )
 
-                # 現在の出馬表で取れない場合だけ過去走ページを補完。
+                # 第2段階: 過去走ページの標準構造から取得。
                 if style == "不明" and past_soup is not None:
                     past_style = extract_style_from_past_page(
                         past_soup,
@@ -1007,6 +1122,21 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     if past_style != "不明":
                         style = past_style
                         style_source = "過去走"
+
+                # 第3段階: class名やHTML構造が変わっていても、
+                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
+                if style == "不明" and past_soup is not None:
+                    inferred_style = (
+                        extract_style_from_any_past_horse_text(
+                            past_soup,
+                            uma,
+                            horse_name,
+                        )
+                    )
+
+                    if inferred_style != "不明":
+                        style = inferred_style
+                        style_source = "過去走・通過順位推定"
 
                 style_display = {
                     "逃": "逃げ",
