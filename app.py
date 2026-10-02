@@ -5,601 +5,2260 @@ from bs4 import BeautifulSoup
 import re
 import numpy as np
 import os
+import hashlib
 from datetime import datetime
 
-# ==========================================
-# 0. アプリ基本設定 & セッション状態
-# ==========================================
-st.set_page_config(page_title="JRA AI予想 & 成績検証エンジン", page_icon="🏇", layout="wide")
 
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
+# ============================================================
+# 0. アプリ基本設定
+# ============================================================
 
-# ログイン認証処理
-def check_password():
-    if st.session_state["authenticated"]:
-        return True
-    
-    st.title("🔒 ログイン")
-    password_input = st.text_input("パスワードを入力してください", type="password")
-    if st.button("ログイン"):
-        if "APP_PASSWORD" in st.secrets and password_input == st.secrets["APP_PASSWORD"]:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("パスワードが正しくありません。")
-    return False
+st.set_page_config(
+    page_title="JRA AI予想 & 成績検証エンジン",
+    page_icon="🏇",
+    layout="wide"
+)
 
-if not check_password():
-    st.stop()
 
-# ==========================================
-# 1. 定数・マスター定義 (Ver.1.11)
-# ==========================================
-VERSION = "Ver.1.11 (前日出走表対応版)"
+# ============================================================
+# 1. バージョン・マスター
+# ============================================================
 
-JRA_VENUES = ["東京", "中山", "阪神", "京都", "中京", "新潟", "福島", "小倉", "札幌", "函館"]
+VERSION = "Ver.2.00"
+
+APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
+
+JRA_VENUES = [
+    "東京", "中山", "阪神", "京都", "中京",
+    "新潟", "福島", "小倉", "札幌", "函館"
+]
+
 VENUE_CODE_MAP = {
-    "札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
-    "中山": "06", "中京": "07", "京都": "08", "阪神": "09", "小倉": "10"
+    "札幌": "01",
+    "函館": "02",
+    "福島": "03",
+    "新潟": "04",
+    "東京": "05",
+    "中山": "06",
+    "中京": "07",
+    "京都": "08",
+    "阪神": "09",
+    "小倉": "10",
+}
+
+VENUE_NAME_MAP = {
+    v: k for k, v in VENUE_CODE_MAP.items()
 }
 
 TURF_DISTANCES = [
-    "1000m", "1200m", "1400m", "1500m", "1600m", 
-    "1800m", "2000m", "2200m", "2400m", "2500m", 
+    "1000m", "1200m", "1400m", "1500m", "1600m",
+    "1800m", "2000m", "2200m", "2400m", "2500m",
     "2600m", "3000m", "3200m", "3400m", "3600m"
 ]
 
 DIRT_DISTANCES = [
-    "1000m", "1150m", "1200m", "1400m", "1600m", 
+    "1000m", "1150m", "1200m", "1400m", "1600m",
     "1700m", "1800m", "2100m", "2400m", "2500m"
 ]
 
-ALL_DISTANCES = sorted(list(set(TURF_DISTANCES + DIRT_DISTANCES)), key=lambda x: int(x.replace('m', '')))
+ALL_DISTANCES = sorted(
+    list(set(TURF_DISTANCES + DIRT_DISTANCES)),
+    key=lambda x: int(x.replace("m", ""))
+)
+
 ALL_DISTANCES_WITH_OTHER = ALL_DISTANCES + ["その他"]
 
+
 CSV_FILENAME = "JRA_Prediction_History.csv"
+
 CSV_COLUMNS = [
-    "レースID", "レース名", "開催日", "予想日時", "コース", "距離", 
-    "馬場状態", "出走頭数", "勝負度", "軸馬", "相手馬", "単勝オッズ", 
-    "バイアス履歴", "モデルバージョン", "確定フラグ", "回収額", "収支", "メモ", "投資額"
+    "予測ログID",
+    "レースID",
+    "レース名",
+    "開催日",
+    "予想日時",
+    "データ取得日時",
+    "コース",
+    "距離",
+    "馬場状態",
+    "出走頭数",
+    "勝負度",
+    "軸馬",
+    "相手馬",
+    "軸馬オッズ",
+    "バイアス履歴",
+    "モデルバージョン",
+    "確定フラグ",
+    "回収額",
+    "収支",
+    "メモ",
+    "投資額",
+    "オッズ状態",
+    "オッズ取得率",
 ]
 
+
+# ============================================================
+# 2. セッション状態
+# ============================================================
+
+DEFAULT_SESSION_VALUES = {
+    "authenticated": False,
+    "fetched_info": None,
+    "latest_prediction": None,
+}
+
+for key, value in DEFAULT_SESSION_VALUES.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ============================================================
+# 3. ログイン
+# ============================================================
+
+def check_password():
+    if st.session_state["authenticated"]:
+        return True
+
+    st.title("🔒 ログイン")
+
+    password_input = st.text_input(
+        "パスワードを入力してください",
+        type="password"
+    )
+
+    if st.button("ログイン", use_container_width=True):
+        app_password = st.secrets.get("APP_PASSWORD", "")
+
+        if app_password and password_input == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません。")
+
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
+# ============================================================
+# 4. CSV管理
+# ============================================================
+
 def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
-    numeric_cols = ["出走頭数", "単勝オッズ", "回収額", "収支", "投資額"]
+
+    df = df.copy()
+
+    numeric_cols = [
+        "出走頭数",
+        "軸馬オッズ",
+        "回収額",
+        "収支",
+        "投資額",
+        "オッズ取得率",
+    ]
+
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            ).fillna(0)
+
     return df
 
+
+def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+
+    df = df.copy()
+
+    for col in CSV_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[CSV_COLUMNS]
+
+    return sanitize_df_types(df)
+
+
 def load_history_df():
+
     if os.path.exists(CSV_FILENAME):
+
         try:
-            df = pd.read_csv(CSV_FILENAME, encoding="utf-8-sig")
-            for col in CSV_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            df = sanitize_df_types(df[CSV_COLUMNS])
+
+            df = pd.read_csv(
+                CSV_FILENAME,
+                encoding="utf-8-sig"
+            )
+
+            df = normalize_history_columns(df)
+
             st.session_state["history_df"] = df
+
             return df
-        except Exception:
-            pass
-            
+
+        except Exception as e:
+
+            st.warning(
+                f"履歴CSVの読み込みに失敗しました。"
+                f"新しい履歴として扱います: {e}"
+            )
+
     if "history_df" not in st.session_state:
-        st.session_state["history_df"] = pd.DataFrame(columns=CSV_COLUMNS)
+
+        st.session_state["history_df"] = pd.DataFrame(
+            columns=CSV_COLUMNS
+        )
+
     return st.session_state["history_df"]
 
-def save_history_df(df: pd.DataFrame):
-    st.session_state["history_df"] = df
-    try:
-        df.to_csv(CSV_FILENAME, index=False, encoding="utf-8-sig")
-    except Exception as e:
-        st.error(f"ファイル保存エラー: {str(e)}")
-    return True
 
-if "latest_prediction" not in st.session_state:
-    st.session_state["latest_prediction"] = None
+def save_history_df(df: pd.DataFrame):
+
+    df = normalize_history_columns(df)
+
+    st.session_state["history_df"] = df
+
+    try:
+
+        df.to_csv(
+            CSV_FILENAME,
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+        return True
+
+    except Exception as e:
+
+        st.error(
+            f"ファイル保存エラー: {str(e)}"
+        )
+
+        return False
+
 
 load_history_df()
 
-# ==========================================
-# 2. 解析補助関数 & netkeibaスクレイピング
-# ==========================================
-def generate_jra_race_id(year: int, venue_name: str, kai: int, nichi: int, race_num: int) -> str:
-    v_code = VENUE_CODE_MAP.get(venue_name, "05")
-    return f"{year}{v_code}{kai:02d}{nichi:02d}{race_num:02d}"
+
+# ============================================================
+# 5. レースID
+# ============================================================
+
+def generate_jra_race_id(
+    year: int,
+    venue_name: str,
+    kai: int,
+    nichi: int,
+    race_num: int
+) -> str:
+
+    venue_code = VENUE_CODE_MAP.get(
+        venue_name,
+        "05"
+    )
+
+    return (
+        f"{year}"
+        f"{venue_code}"
+        f"{kai:02d}"
+        f"{nichi:02d}"
+        f"{race_num:02d}"
+    )
+
+
+def extract_race_id(value: str):
+
+    if not value:
+        return None
+
+    match = re.search(
+        r"(\d{12})",
+        str(value)
+    )
+
+    if not match:
+        return None
+
+    return match.group(1)
+
+
+# ============================================================
+# 6. 距離解析
+# ============================================================
 
 def parse_distance_from_text(text: str) -> str:
+
     if not text:
         return "その他"
-    match = re.search(r'(\d{4}|\d{3})\s*m', text)
+
+    text = str(text)
+
+    match = re.search(
+        r"(\d{3,4})\s*m",
+        text,
+        flags=re.IGNORECASE
+    )
+
     if match:
-        dist_str = f"{match.group(1)}m"
-        if dist_str in ALL_DISTANCES:
-            return dist_str
-    match_num = re.search(r'(\d{4}|\d{3})', text)
-    if match_num:
-        dist_str = f"{match_num.group(1)}m"
-        if dist_str in ALL_DISTANCES:
-            return dist_str
+
+        dist = f"{match.group(1)}m"
+
+        if dist in ALL_DISTANCES:
+            return dist
+
+    match = re.search(
+        r"(\d{3,4})",
+        text
+    )
+
+    if match:
+
+        dist = f"{match.group(1)}m"
+
+        if dist in ALL_DISTANCES:
+            return dist
+
     return "その他"
 
-def fetch_netkeiba_race_data(race_id_or_url: str):
-    """文字化け防止 & オッズ未発表時も仮補完で正常抽出できるスクレイパー"""
-    race_id_match = re.search(r'(\d{12})', race_id_or_url)
-    if not race_id_match:
-        return None, "有効な12桁のレースIDが見つかりません。"
-        
-    race_id = race_id_match.group(1)
-    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        res.raise_for_status()
-        
-        # 文字化け防止用のエンコーディング自動判定
-        if res.encoding.lower() not in ['euc-jp', 'utf-8']:
-            res.encoding = 'euc-jp'
-            
-        soup = BeautifulSoup(res.content.decode('euc-jp', 'ignore'), 'html.parser')
-        
-        if not soup.find('div', class_='RaceData01'):
-            return None, f"レース(ID: {race_id})が見つかりませんでした。開催場・回数・日目・R番号をご確認ください。"
 
-        extracted_info = {
+# ============================================================
+# 7. オッズ抽出
+# ============================================================
+
+def parse_odds(text: str):
+
+    if not text:
+        return None
+
+    text = str(text).strip()
+
+    match = re.search(
+        r"(?<!\d)(\d+(?:\.\d+))(?!\d)",
+        text
+    )
+
+    if not match:
+        return None
+
+    try:
+
+        value = float(match.group(1))
+
+        if value > 0:
+            return value
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
+# 8. netkeibaデータ取得
+# ============================================================
+
+@st.cache_data(
+    ttl=30,
+    show_spinner=False
+)
+def fetch_netkeiba_race_data_cached(
+    race_id: str
+):
+
+    url = (
+        "https://race.netkeiba.com/race/"
+        f"shutuba.html?race_id={race_id}"
+    )
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/120.0.0.0 "
+            "Safari/537.36"
+        )
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=15
+        )
+
+        response.raise_for_status()
+
+        response.encoding = (
+            response.apparent_encoding
+            or "euc-jp"
+        )
+
+        html = response.text
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+
+        race_data_01 = soup.find(
+            "div",
+            class_="RaceData01"
+        )
+
+        if race_data_01 is None:
+
+            return None, (
+                f"レース(ID:{race_id})が取得できませんでした。"
+                "レースID、開催日、開催回、日目をご確認ください。"
+            )
+
+        venue_code = race_id[4:6]
+
+        detected_venue = VENUE_NAME_MAP.get(
+            venue_code,
+            "不明"
+        )
+
+        race_num = int(race_id[-2:])
+
+        extracted = {
             "race_id": race_id,
+            "venue": detected_venue,
+            "race_num": race_num,
             "track_type": "芝",
-            "distance": "1600m",
-            "venue": "東京",
-            "race_num": int(race_id[-2:]),
+            "distance": "その他",
             "condition": "良",
             "race_name": f"レース_{race_id}",
-            "race_date": datetime.now(),
-            "is_odds_preliminary": False
+            "race_date": None,
+            "horses": [],
+            "kyaku_count": 0,
+            "front_runner_count": 0,
+            "odds_coverage": 0.0,
+            "odds_status": "前日暫定",
+            "fetched_at": datetime.now(),
         }
-        
-        race_data_02 = soup.find('div', class_='RaceData02')
+
+        race_data_02 = soup.find(
+            "div",
+            class_="RaceData02"
+        )
+
         if race_data_02:
-            date_match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', race_data_02.text)
+
+            date_match = re.search(
+                r"(\d{4})年(\d{1,2})月(\d{1,2})日",
+                race_data_02.get_text(" ", strip=True)
+            )
+
             if date_match:
-                y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
-                extracted_info["race_date"] = datetime(y, m, d)
 
-        race_title_elem = soup.find('div', class_='RaceName')
-        if race_title_elem:
-            extracted_info["race_name"] = race_title_elem.text.strip()
+                y, m, d = map(
+                    int,
+                    date_match.groups()
+                )
 
-        race_data_intro = soup.find('div', class_='RaceData01')
-        if race_data_intro:
-            text_info = race_data_intro.text
-            if "ダ" in text_info or "ダート" in text_info:
-                extracted_info["track_type"] = "ダート"
-            elif "障" in text_info:
-                extracted_info["track_type"] = "障害"
-                
-            dist_parsed = parse_distance_from_text(text_info)
-            if dist_parsed != "その他":
-                extracted_info["distance"] = dist_parsed
-                
-            if "不良" in text_info:
-                extracted_info["condition"] = "不良"
-            elif "稍重" in text_info or "稍" in text_info:
-                extracted_info["condition"] = "稍重"
-            elif "重" in text_info:
-                extracted_info["condition"] = "重"
-            else:
-                extracted_info["condition"] = "良"
+                extracted["race_date"] = datetime(
+                    y, m, d
+                )
 
-        horse_rows = soup.find_all('tr', class_='HorseList')
+        if extracted["race_date"] is None:
+
+            extracted["race_date"] = datetime.now()
+
+        race_title = soup.find(
+            "div",
+            class_="RaceName"
+        )
+
+        if race_title:
+
+            name = race_title.get_text(
+                " ",
+                strip=True
+            )
+
+            if name:
+                extracted["race_name"] = name
+
+        race_text = race_data_01.get_text(
+            " ",
+            strip=True
+        )
+
+        if "ダ" in race_text:
+
+            extracted["track_type"] = "ダート"
+
+        elif "障" in race_text:
+
+            extracted["track_type"] = "障害"
+
+        else:
+
+            extracted["track_type"] = "芝"
+
+        parsed_distance = parse_distance_from_text(
+            race_text
+        )
+
+        if parsed_distance != "その他":
+
+            extracted["distance"] = parsed_distance
+
+        if "不良" in race_text:
+
+            extracted["condition"] = "不良"
+
+        elif "稍重" in race_text:
+
+            extracted["condition"] = "稍重"
+
+        elif "重" in race_text:
+
+            extracted["condition"] = "重"
+
+        else:
+
+            extracted["condition"] = "良"
+
+        horse_rows = soup.find_all(
+            "tr",
+            class_="HorseList"
+        )
+
         if not horse_rows:
-            return None, "出走表テーブルが見つかりませんでした。"
-            
+
+            return None, (
+                "出走馬テーブルが見つかりませんでした。"
+            )
+
         horses = []
+
         kyaku_count = 0
         front_runner_count = 0
-        preliminary_odds_count = 0
+        valid_odds_count = 0
 
         for row in horse_rows:
-            try:
-                wakuban_elem = row.find('td', class_=re.compile('Waku'))
-                wakuban = int(wakuban_elem.text.strip()) if wakuban_elem and wakuban_elem.text.strip().isdigit() else 0
 
-                umaban_elem = row.find('td', class_=re.compile('Umaban'))
-                umaban = int(umaban_elem.text.strip()) if umaban_elem and umaban_elem.text.strip().isdigit() else 0
-                
-                horse_elem = row.find('span', class_='HorseName')
-                horse_name = horse_elem.text.strip() if horse_elem else ""
-                
-                jockey_elem = row.find('td', class_='Jockey')
-                jockey = jockey_elem.text.strip() if jockey_elem else ""
-                
-                kyakushitsu = "不明"
-                kyaku_elem = row.find('td', class_=re.compile('Kyakushitsu|Style|RunningStyle'))
-                if not kyaku_elem:
-                    kyaku_elem = row.find('span', class_=re.compile('Kyakushitsu|Style'))
-                
-                if kyaku_elem and kyaku_elem.text.strip():
-                    kyakushitsu = kyaku_elem.text.strip()
+            try:
+
+                waku_elem = row.find(
+                    "td",
+                    class_=re.compile("Waku")
+                )
+
+                waku_text = (
+                    waku_elem.get_text(
+                        strip=True
+                    )
+                    if waku_elem
+                    else ""
+                )
+
+                waku_match = re.search(
+                    r"\d+",
+                    waku_text
+                )
+
+                waku = (
+                    int(waku_match.group())
+                    if waku_match
+                    else 0
+                )
+
+                uma_elem = row.find(
+                    "td",
+                    class_=re.compile("Umaban")
+                )
+
+                uma_text = (
+                    uma_elem.get_text(
+                        strip=True
+                    )
+                    if uma_elem
+                    else ""
+                )
+
+                uma_match = re.search(
+                    r"\d+",
+                    uma_text
+                )
+
+                uma = (
+                    int(uma_match.group())
+                    if uma_match
+                    else 0
+                )
+
+                horse_elem = row.find(
+                    "span",
+                    class_="HorseName"
+                )
+
+                horse_name = (
+                    horse_elem.get_text(
+                        " ",
+                        strip=True
+                    )
+                    if horse_elem
+                    else ""
+                )
+
+                jockey_elem = row.find(
+                    "td",
+                    class_="Jockey"
+                )
+
+                jockey = (
+                    jockey_elem.get_text(
+                        " ",
+                        strip=True
+                    )
+                    if jockey_elem
+                    else ""
+                )
+
+                style_elem = row.find(
+                    "td",
+                    class_=re.compile(
+                        "Kyakushitsu|Style|RunningStyle"
+                    )
+                )
+
+                if not style_elem:
+
+                    style_elem = row.find(
+                        "span",
+                        class_=re.compile(
+                            "Kyakushitsu|Style"
+                        )
+                    )
+
+                kyakushitsu = (
+                    style_elem.get_text(
+                        " ",
+                        strip=True
+                    )
+                    if style_elem
+                    else "不明"
+                )
+
+                if kyakushitsu != "不明":
+
                     kyaku_count += 1
-                    if "逃" in kyakushitsu or "先" in kyakushitsu:
+
+                    if (
+                        "逃" in kyakushitsu
+                        or "先" in kyakushitsu
+                    ):
+
                         front_runner_count += 1
 
-                # オッズ抽出（未確定時は10.0倍として仮設定し、エラー停止を回避）
-                odds_elem = row.find('span', class_=re.compile('Popular_Ninki|Odds'))
                 odds = None
-                if odds_elem:
-                    match_odds = re.search(r'\b(\d+\.\d+)\b', odds_elem.text.strip())
-                    if match_odds:
-                        try:
-                            odds = float(match_odds.group(1))
-                        except ValueError:
-                            odds = None
-                
-                if odds is None or odds <= 0:
-                    odds = 10.0 # オッズ未確定（前日等）の場合は仮数値をセット
-                    preliminary_odds_count += 1
 
-                if horse_name and umaban > 0:
-                    horses.append({
-                        "枠番": wakuban,
-                        "馬番": umaban,
-                        "馬名": horse_name,
-                        "騎手": jockey,
-                        "脚質": kyakushitsu,
-                        "オッズ": odds
-                    })
+                odds_elem = row.find(
+                    "span",
+                    class_=re.compile(
+                        "Odds|Popular_Ninki"
+                    )
+                )
+
+                if odds_elem:
+
+                    odds = parse_odds(
+                        odds_elem.get_text(
+                            " ",
+                            strip=True
+                        )
+                    )
+
+                if odds is None:
+
+                    row_text = row.get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    candidates = re.findall(
+                        r"(?<!\d)(\d+\.\d+)(?!\d)",
+                        row_text
+                    )
+
+                    for candidate in candidates:
+
+                        try:
+
+                            candidate_value = float(
+                                candidate
+                            )
+
+                            if candidate_value >= 1.0:
+
+                                odds = candidate_value
+                                break
+
+                        except Exception:
+                            continue
+
+                if odds is not None and odds > 0:
+
+                    valid_odds_count += 1
+
+                if horse_name and uma > 0:
+
+                    horses.append(
+                        {
+                            "枠番": waku,
+                            "馬番": uma,
+                            "馬名": horse_name,
+                            "騎手": jockey,
+                            "脚質": kyakushitsu,
+                            "オッズ": odds,
+                        }
+                    )
+
             except Exception:
                 continue
-                
-        if len(horses) == 0:
-            return None, "出走馬データの抽出件数が0件です。"
-            
-        if preliminary_odds_count > 0:
-            extracted_info["is_odds_preliminary"] = True
 
-        extracted_info["horses"] = horses
-        extracted_info["kyaku_count"] = kyaku_count
-        extracted_info["front_runner_count"] = front_runner_count
-        return extracted_info, None
-        
-    except requests.exceptions.RequestException as req_err:
-        return None, f"通信エラーが発生しました: {str(req_err)}"
+        if not horses:
+
+            return None, (
+                "出走馬データの抽出件数が0件です。"
+            )
+
+        odds_coverage = (
+            valid_odds_count / len(horses)
+        )
+
+        if odds_coverage >= 0.99:
+
+            odds_status = "当日確定"
+
+        elif odds_coverage >= 0.70:
+
+            odds_status = "当日一部欠損"
+
+        else:
+
+            odds_status = "前日暫定"
+
+        extracted["horses"] = horses
+        extracted["kyaku_count"] = kyaku_count
+        extracted["front_runner_count"] = front_runner_count
+        extracted["odds_coverage"] = odds_coverage
+        extracted["odds_status"] = odds_status
+
+        return extracted, None
+
+    except requests.exceptions.RequestException as e:
+
+        return None, (
+            f"通信エラー: {str(e)}"
+        )
+
     except Exception as e:
-        return None, f"解析エラーが発生しました: {str(e)}"
 
-# ==========================================
-# 3. サイドバー・画面切り替え
-# ==========================================
-st.sidebar.title("🏇 JRA AI予想 engine")
-st.sidebar.caption(f"現在のバージョン: **{VERSION}**")
+        return None, (
+            f"解析エラー: {str(e)}"
+        )
 
-mode = st.sidebar.radio("機能メニュー", ["🏇 リアルタイム予想", "📊 成績ダッシュボード・結果入力"])
 
-# ==========================================
-# 4. 画面 1: リアルタイム予想
-# ==========================================
+def fetch_netkeiba_race_data(race_id_or_url):
+
+    race_id = extract_race_id(
+        race_id_or_url
+    )
+
+    if not race_id:
+
+        return None, (
+            "有効な12桁のレースIDが見つかりません。"
+        )
+
+    return fetch_netkeiba_race_data_cached(
+        race_id
+    )
+
+
+# ============================================================
+# 9. モデル補正
+# ============================================================
+
+def safe_log_multiplier(
+    multiplier: float
+) -> float:
+
+    return np.log(
+        max(multiplier, 0.01)
+    )
+
+
+def calculate_model_score(
+    horse,
+    fetched_info,
+    track_type,
+    distance,
+    front_bias,
+    inside_bias,
+    outer_bias,
+    green_belt,
+    g1_mode
+):
+
+    score = 0.0
+
+    horse_num = int(
+        horse.get("馬番", 0)
+    )
+
+    waku_num = int(
+        horse.get("枠番", 0)
+    )
+
+    jockey = str(
+        horse.get("騎手", "")
+    ).replace(" ", "").replace(" ", "")
+
+    style = str(
+        horse.get("脚質", "")
+    )
+
+    total_horses = len(
+        fetched_info["horses"]
+    )
+
+    kyaku_rate = (
+        fetched_info["kyaku_count"]
+        / max(total_horses, 1)
+    )
+
+    if "ルメール" in jockey:
+
+        score += safe_log_multiplier(1.15)
+
+    elif "川田" in jockey:
+
+        score += safe_log_multiplier(1.15)
+
+    if (
+        front_bias
+        and kyaku_rate >= 0.70
+        and (
+            "逃" in style
+            or "先" in style
+        )
+    ):
+
+        score += safe_log_multiplier(1.08)
+
+    if inside_bias:
+
+        if waku_num in [1, 2]:
+
+            score += safe_log_multiplier(1.05)
+
+        elif waku_num == 0 and horse_num <= 2:
+
+            score += safe_log_multiplier(1.05)
+
+    if outer_bias:
+
+        if waku_num in [7, 8]:
+
+            score += safe_log_multiplier(1.05)
+
+        elif (
+            waku_num == 0
+            and horse_num >= total_horses - 2
+        ):
+
+            score += safe_log_multiplier(1.05)
+
+    if (
+        track_type == "ダート"
+        and distance == "1200m"
+    ):
+
+        if waku_num in [1, 2]:
+
+            score += safe_log_multiplier(1.08)
+
+    if green_belt and horse_num == 1:
+
+        score += safe_log_multiplier(1.06)
+
+    if g1_mode and horse_num in [1, 3, 7]:
+
+        score += safe_log_multiplier(1.03)
+
+    return score
+
+
+# ============================================================
+# 10. モデル確率化
+# ============================================================
+
+def scores_to_probabilities(scores):
+
+    scores = np.asarray(
+        scores,
+        dtype=float
+    )
+
+    if len(scores) == 0:
+
+        return np.array([])
+
+    max_score = np.max(scores)
+
+    exp_scores = np.exp(
+        scores - max_score
+    )
+
+    total = np.sum(exp_scores)
+
+    if total <= 0:
+
+        return np.ones(
+            len(scores)
+        ) / len(scores)
+
+    return exp_scores / total
+
+
+# ============================================================
+# 11. Value Index
+# ============================================================
+
+def calculate_value_index(
+    model_probability,
+    odds,
+    odds_status
+):
+
+    if odds_status not in [
+        "当日確定",
+        "当日一部欠損"
+    ]:
+
+        return None
+
+    if odds is None:
+        return None
+
+    try:
+
+        odds = float(odds)
+
+    except Exception:
+
+        return None
+
+    if odds <= 0:
+        return None
+
+    market_implied_probability = 1.0 / odds
+
+    if market_implied_probability <= 0:
+        return None
+
+    value_index = (
+        model_probability
+        / market_implied_probability
+    )
+
+    return round(
+        float(value_index),
+        2
+    )
+
+
+# ============================================================
+# 12. 予測ログID
+# ============================================================
+
+def create_prediction_log_id(
+    race_id,
+    prediction_time
+):
+
+    raw = (
+        f"{race_id}|"
+        f"{prediction_time}|"
+        f"{VERSION}"
+    )
+
+    digest = hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:12]
+
+    return f"{race_id}-{digest}"
+
+
+# ============================================================
+# 13. サイドバー
+# ============================================================
+
+st.sidebar.title(
+    "🏇 JRA AI予想 engine"
+)
+
+st.sidebar.caption(
+    f"モデル: **{VERSION}**"
+)
+
+mode = st.sidebar.radio(
+    "機能メニュー",
+    [
+        "🏇 リアルタイム予想",
+        "📊 成績ダッシュボード・結果入力",
+    ]
+)
+
+
+# ============================================================
+# 14. リアルタイム予想
+# ============================================================
+
 if mode == "🏇 リアルタイム予想":
-    st.header("🏇 リアルタイム予想 & スコアリング")
-    st.caption("※ 前日出走表（オッズ未確定時）でも予想計算が可能です。")
-    
-    # 1. 自動レース選択セクション
-    st.markdown("### 📅 対象レースの選択（自動データ取得）")
-    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-    
-    with col_d1:
-        selected_date = st.date_input("開催日", pd.Timestamp.now())
-    with col_d2:
-        selected_venue = st.selectbox("競馬場", JRA_VENUES, index=0)
-    with col_d3:
-        kai_val = st.number_input("開催回 (例: 4回中山)", min_value=1, max_value=6, value=4, step=1)
-    with col_d4:
-        nichi_val = st.number_input("日目 (例: 8日目)", min_value=1, max_value=12, value=8, step=1)
 
-    col_r1, col_r2 = st.columns([1, 2])
-    with col_r1:
-        race_num_val = st.selectbox("レース番号", [f"{i}R" for i in range(1, 13)], index=10)
-        r_int = int(race_num_val.replace("R", ""))
+    st.header(
+        "🏇 リアルタイム予想 & スコアリング"
+    )
 
-    auto_generated_id = generate_jra_race_id(selected_date.year, selected_venue, kai_val, nichi_val, r_int)
+    st.info(
+        "このモデルは、出走馬情報・騎手・脚質・枠・"
+        "コース条件などからモデル内相対評価を算出し、"
+        "その後に市場オッズと比較してValue Indexを計算します。"
+    )
 
-    with col_r2:
-        manual_url_or_id = st.text_input(
-            "または 直接URL / 12桁ID を指定（任意）",
-            placeholder=f"自動計算ID: {auto_generated_id}"
+    st.markdown(
+        "### 📅 対象レース"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+
+        selected_date = st.date_input(
+            "開催日",
+            value=pd.Timestamp.now()
         )
 
-    target_race_id = manual_url_or_id.strip() if manual_url_or_id.strip() else auto_generated_id
+    with c2:
 
-    # 自動データ取得ボタン
-    fetched_info = None
-    if st.button("🔄 出走表・最新オッズを自動読み込み"):
-        with st.spinner(f"netkeibaからレースID [{target_race_id}] の出走表を自動取得中..."):
-            info, err = fetch_netkeiba_race_data(target_race_id)
-            if err:
-                st.error(f"❌ {err}")
-            else:
-                st.session_state["fetched_info"] = info
-                st.rerun()
+        selected_venue = st.selectbox(
+            "競馬場",
+            JRA_VENUES
+        )
 
-    if "fetched_info" in st.session_state and st.session_state["fetched_info"]:
-        fetched_info = st.session_state["fetched_info"]
-        kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
-        
-        odds_msg = "⚠️ オッズ未確定（前日仮数値適用中）" if fetched_info.get("is_odds_preliminary") else "✅ リアルタイムオッズ取得済"
-        
+    with c3:
+
+        kai_val = st.number_input(
+            "開催回",
+            min_value=1,
+            max_value=6,
+            value=4
+        )
+
+    with c4:
+
+        nichi_val = st.number_input(
+            "日目",
+            min_value=1,
+            max_value=12,
+            value=8
+        )
+
+    c5, c6 = st.columns([1, 2])
+
+    with c5:
+
+        race_num_val = st.selectbox(
+            "レース番号",
+            [f"{i}R" for i in range(1, 13)],
+            index=10
+        )
+
+        race_num = int(
+            race_num_val.replace("R", "")
+        )
+
+    auto_race_id = generate_jra_race_id(
+        selected_date.year,
+        selected_venue,
+        kai_val,
+        nichi_val,
+        race_num
+    )
+
+    with c6:
+
+        manual_input = st.text_input(
+            "直接URL / 12桁レースID",
+            placeholder=auto_race_id
+        )
+
+    target_race_id = (
+        extract_race_id(manual_input)
+        if manual_input.strip()
+        else auto_race_id
+    )
+
+    if st.button(
+        "🔄 出走表・最新データ取得",
+        use_container_width=True
+    ):
+
+        with st.spinner(
+            f"レースID {target_race_id} を取得中..."
+        ):
+
+            info, error = (
+                fetch_netkeiba_race_data(
+                    target_race_id
+                )
+            )
+
+        if error:
+
+            st.error(error)
+
+        else:
+
+            st.session_state[
+                "fetched_info"
+            ] = info
+
+            st.session_state[
+                "latest_prediction"
+            ] = None
+
+            st.rerun()
+
+    fetched_info = (
+        st.session_state.get(
+            "fetched_info"
+        )
+    )
+
+    if fetched_info:
+
+        kyaku_rate = (
+            fetched_info["kyaku_count"]
+            / max(
+                len(fetched_info["horses"]),
+                1
+            )
+        )
+
         st.success(
-            f"✅ 出走表の取得成功: **{fetched_info['race_name']}** "
-            f"（{len(fetched_info['horses'])}頭 / {fetched_info['venue']}{fetched_info['race_num']}R / "
-            f"{fetched_info['track_type']}{fetched_info['distance']} [{fetched_info['condition']}] / "
-            f"開催日:{fetched_info['race_date'].strftime('%Y/%m/%d')}）\n\n"
-            f"💡 状態: {odds_msg} | 脚質検出 {fetched_info['kyaku_count']}/{len(fetched_info['horses'])}頭 ({kyaku_rate:.0%})"
+            f"✅ **{fetched_info['race_name']}** "
+            f"| {fetched_info['venue']}"
+            f"{fetched_info['race_num']}R "
+            f"| {fetched_info['track_type']}"
+            f"{fetched_info['distance']} "
+            f"| {fetched_info['condition']} "
+            f"| {fetched_info['race_date'].strftime('%Y/%m/%d')}"
         )
 
-    # 2. コース条件・距離マスター選択
-    st.markdown("### ⚙️ レース条件の確認・調整")
-    col_track, col_dist, col_cond = st.columns(3)
-    
-    default_track = fetched_info["track_type"] if fetched_info else "芝"
-    track_idx = ["芝", "ダート", "障害"].index(default_track) if default_track in ["芝", "ダート", "障害"] else 0
+        m1, m2, m3, m4 = st.columns(4)
 
-    with col_track:
-        track_type = st.selectbox("コース種別", ["芝", "ダート", "障害"], index=track_idx)
-        
+        m1.metric(
+            "出走頭数",
+            f"{len(fetched_info['horses'])}頭"
+        )
+
+        m2.metric(
+            "脚質取得率",
+            f"{kyaku_rate:.0%}"
+        )
+
+        m3.metric(
+            "オッズ取得率",
+            f"{fetched_info['odds_coverage']:.0%}"
+        )
+
+        m4.metric(
+            "オッズ状態",
+            fetched_info["odds_status"]
+        )
+
+        if kyaku_rate < 0.70:
+
+            st.warning(
+                "脚質取得率が70%未満です。"
+                "前残り補正を使う場合は注意してください。"
+            )
+
+        if (
+            fetched_info["odds_status"]
+            == "前日暫定"
+        ):
+
+            st.info(
+                "現在は前日暫定モードです。"
+                "市場オッズとのValue Index比較は行いません。"
+            )
+
+        elif (
+            fetched_info["odds_status"]
+            == "当日一部欠損"
+        ):
+
+            st.warning(
+                "オッズの一部が取得できていません。"
+                "取得できた馬のみValue Indexを表示します。"
+            )
+
+        with st.expander(
+            "🐎 取得した出走馬データを確認"
+        ):
+
+            horse_preview = pd.DataFrame(
+                fetched_info["horses"]
+            )
+
+            st.dataframe(
+                horse_preview,
+                use_container_width=True
+            )
+
+    st.markdown(
+        "### ⚙️ モデル条件"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    default_track = (
+        fetched_info["track_type"]
+        if fetched_info
+        else "芝"
+    )
+
+    with c1:
+
+        track_type = st.selectbox(
+            "コース種別",
+            ["芝", "ダート", "障害"],
+            index=[
+                "芝",
+                "ダート",
+                "障害"
+            ].index(default_track)
+        )
+
     if track_type == "芝":
-        dist_options = TURF_DISTANCES + ["その他"]
+
+        distance_options = (
+            TURF_DISTANCES
+            + ["その他"]
+        )
+
     elif track_type == "ダート":
-        dist_options = DIRT_DISTANCES + ["その他"]
+
+        distance_options = (
+            DIRT_DISTANCES
+            + ["その他"]
+        )
+
     else:
-        dist_options = ALL_DISTANCES_WITH_OTHER
 
-    default_parsed_dist = fetched_info["distance"] if fetched_info else "1600m"
-    default_index = dist_options.index(default_parsed_dist) if default_parsed_dist in dist_options else dist_options.index("その他")
+        distance_options = (
+            ALL_DISTANCES_WITH_OTHER
+        )
 
-    with col_dist:
-        selected_distance = st.selectbox("距離設定 (JRA主要距離)", options=dist_options, index=default_index)
+    default_distance = (
+        fetched_info["distance"]
+        if fetched_info
+        else "1600m"
+    )
 
-    if selected_distance == "その他":
-        custom_dist = st.text_input("手動距離入力 (例: 1100m)", value="")
-        final_distance = custom_dist if custom_dist else "その他"
+    with c2:
+
+        distance = st.selectbox(
+            "距離",
+            distance_options,
+            index=(
+                distance_options.index(
+                    default_distance
+                )
+                if default_distance
+                in distance_options
+                else len(distance_options) - 1
+            )
+        )
+
+    if distance == "その他":
+
+        custom_distance = st.text_input(
+            "手動距離",
+            value=""
+        )
+
+        final_distance = (
+            custom_distance
+            if custom_distance
+            else "その他"
+        )
+
     else:
-        final_distance = selected_distance
 
-    default_cond = fetched_info["condition"] if fetched_info else "良"
-    cond_idx = ["良", "稍重", "重", "不良"].index(default_cond) if default_cond in ["良", "稍重", "重", "不良"] else 0
+        final_distance = distance
 
-    with col_cond:
-        track_condition = st.selectbox("馬場状態", ["良", "稍重", "重", "不良"], index=cond_idx)
-    
-    # 3. 補正パラメータ設定
-    st.markdown("### 🎛️ 補正パラメータ設定")
-    col_p1, col_p2, col_p3 = st.columns(3)
-    with col_p1:
-        is_front_runner_bias = st.checkbox("前残りバイアス (+log1.08)", value=True)
-        is_inside_bias = st.checkbox("内枠バイアス (1-2枠 +log1.05)", value=False)
-    with col_p2:
-        is_outer_stretch_bias = st.checkbox("外差しバイアス (7-8枠 +log1.05)", value=False)
-        is_green_belt = st.checkbox("グリーンベルト (1番馬 +log1.06)", value=False)
-    with col_p3:
-        g1_mode = st.checkbox("G1サインモード加点 (+log1.03)", value=False)
-        confidence_level = st.select_slider("勝負度", options=["★☆☆", "★★☆", "★★★"], value="★★☆")
+    default_condition = (
+        fetched_info["condition"]
+        if fetched_info
+        else "良"
+    )
 
-    budget_amount = st.number_input("予算設定 (円)", min_value=100, value=1000, step=100)
+    with c3:
 
-    # ガード処理
+        condition = st.selectbox(
+            "馬場状態",
+            ["良", "稍重", "重", "不良"],
+            index=(
+                ["良", "稍重", "重", "不良"]
+                .index(default_condition)
+                if default_condition
+                in ["良", "稍重", "重", "不良"]
+                else 0
+            )
+        )
+
+    st.markdown(
+        "### 🎛️ 補正設定"
+    )
+
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+
+        front_bias = st.checkbox(
+            "前残り補正",
+            value=True
+        )
+
+        inside_bias = st.checkbox(
+            "内枠補正",
+            value=False
+        )
+
+    with b2:
+
+        outer_bias = st.checkbox(
+            "外差し補正",
+            value=False
+        )
+
+        green_belt = st.checkbox(
+            "グリーンベルト補正",
+            value=False
+        )
+
+    with b3:
+
+        g1_mode = st.checkbox(
+            "G1サインモード",
+            value=False
+        )
+
+        confidence = st.select_slider(
+            "勝負度",
+            options=[
+                "★☆☆",
+                "★★☆",
+                "★★★"
+            ],
+            value="★★☆"
+        )
+
+    budget = st.number_input(
+        "参考予算",
+        min_value=100,
+        value=1000,
+        step=100
+    )
+
     if not fetched_info:
-        st.info("💡 上の「🔄 出走表・最新オッズを自動読み込み」ボタンを押して出走馬データをロードしてください。")
-        run_button_disabled = True
+
+        st.info(
+            "まず出走表を取得してください。"
+        )
+
+        run_disabled = True
+
     else:
-        run_button_disabled = False
 
-    if st.button("🚀 AI予想を実行", disabled=run_button_disabled):
-        target_horses = fetched_info["horses"]
-        total_horses = len(target_horses)
+        run_disabled = False
+
+    if st.button(
+        "🚀 モデル予想を実行",
+        disabled=run_disabled,
+        use_container_width=True
+    ):
+
+        horses = fetched_info["horses"]
+
         scores = []
-        
-        for h in target_horses:
-            odds_val = float(h["オッズ"])
-            score = -np.log(odds_val)
-            
-            jockey_str = str(h.get("騎手", "")).replace(" ", "").replace(" ", "")
-            if "ルメール" in jockey_str or "川田" in jockey_str:
-                score += np.log(1.15)
-                
-            horse_num = int(h["馬番"])
-            waku_num = int(h.get("枠番", 0))
-            kyaku = str(h.get("脚質", ""))
 
-            kyaku_rate = fetched_info['kyaku_count'] / len(fetched_info['horses'])
-            if is_front_runner_bias and ("逃" in kyaku or "先" in kyaku):
-                score += np.log(1.08)
-            if is_inside_bias and (waku_num in [1, 2] if waku_num > 0 else horse_num <= 2):
-                score += np.log(1.05)
-            if is_outer_stretch_bias and (waku_num in [7, 8] if waku_num > 0 else horse_num >= (total_horses - 2)):
-                score += np.log(1.05)
-            if track_type == "ダート" and final_distance == "1200m" and (waku_num in [1, 2] if waku_num > 0 else horse_num <= 2):
-                score += np.log(1.08)
-            if is_green_belt and horse_num == 1:
-                score += np.log(1.06)
-            if g1_mode and horse_num in [1, 3, 7]:
-                score += np.log(1.03)
-                
+        for horse in horses:
+
+            score = calculate_model_score(
+                horse=horse,
+                fetched_info=fetched_info,
+                track_type=track_type,
+                distance=final_distance,
+                front_bias=front_bias,
+                inside_bias=inside_bias,
+                outer_bias=outer_bias,
+                green_belt=green_belt,
+                g1_mode=g1_mode
+            )
+
             scores.append(score)
-        
-        exp_scores = np.exp(scores - np.max(scores))
-        model_shares = exp_scores / np.sum(exp_scores)
-        
+
+        probabilities = scores_to_probabilities(
+            scores
+        )
+
         result_rows = []
-        for idx, h in enumerate(target_horses):
-            share = model_shares[idx]
-            val_index = share * float(h["オッズ"])
-            result_rows.append({
-                "枠番": int(h.get("枠番", 0)),
-                "馬番": int(h["馬番"]),
-                "馬名": str(h["馬名"]),
-                "騎手": str(h.get("騎手", "")),
-                "脚質": str(h.get("脚質", "不明")),
-                "単勝オッズ": float(h["オッズ"]),
-                "モデル相対シェア(%)": round(share * 100, 1),
-                "モデル評価指数": round(val_index, 2)
-            })
-            
-        res_df = pd.DataFrame(result_rows).sort_values(by="モデル相対シェア(%)", ascending=False)
-        
-        top_horse = res_df.iloc[0]["馬名"]
-        partner_horses = ", ".join(res_df.iloc[1:min(3, len(res_df))]["馬名"].tolist())
-        top_odds = res_df.iloc[0]["単勝オッズ"]
+
+        for i, horse in enumerate(horses):
+
+            model_probability = (
+                probabilities[i]
+            )
+
+            odds = horse.get(
+                "オッズ"
+            )
+
+            value_index = calculate_value_index(
+                model_probability,
+                odds,
+                fetched_info["odds_status"]
+            )
+
+            result_rows.append(
+                {
+                    "枠番": int(
+                        horse.get("枠番", 0)
+                    ),
+                    "馬番": int(
+                        horse["馬番"]
+                    ),
+                    "馬名": str(
+                        horse["馬名"]
+                    ),
+                    "騎手": str(
+                        horse.get(
+                            "騎手",
+                            ""
+                        )
+                    ),
+                    "脚質": str(
+                        horse.get(
+                            "脚質",
+                            "不明"
+                        )
+                    ),
+                    "単勝オッズ": (
+                        float(odds)
+                        if odds is not None
+                        else "-"
+                    ),
+                    "モデル確率(%)": round(
+                        model_probability * 100,
+                        2
+                    ),
+                    "Value Index": (
+                        value_index
+                        if value_index is not None
+                        else "-"
+                    ),
+                }
+            )
+
+        result_df = pd.DataFrame(
+            result_rows
+        )
+
+        result_df = result_df.sort_values(
+            by="モデル確率(%)",
+            ascending=False
+        ).reset_index(drop=True)
+
+        top_horse = (
+            result_df.iloc[0]["馬名"]
+        )
+
+        partners = result_df.iloc[
+            1:3
+        ]["馬名"].tolist()
+
+        partner_horses = ", ".join(
+            partners
+        )
+
+        top_odds = result_df.iloc[
+            0
+        ]["単勝オッズ"]
+
+        if top_odds == "-":
+
+            top_odds_value = 0.0
+
+        else:
+
+            top_odds_value = float(
+                top_odds
+            )
 
         active_biases = []
-        if is_front_runner_bias: active_biases.append("前残り")
-        if is_inside_bias: active_biases.append("内枠")
-        if is_outer_stretch_bias: active_biases.append("外差し")
-        if is_green_belt: active_biases.append("グリーンベルト")
-        if g1_mode: active_biases.append("G1サイン")
-        bias_str = ",".join(active_biases) if active_biases else "なし"
 
-        st.session_state["latest_prediction"] = {
-            "race_id": target_race_id,
-            "race_name": fetched_info["race_name"],
-            "race_date": selected_date.strftime("%Y-%m-%d"),
-            "predict_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "course": f"{selected_venue}{track_type}",
-            "distance": final_distance,
-            "condition": track_condition,
-            "head_count": total_horses,
-            "confidence": confidence_level,
-            "res_df": res_df,
-            "top_horse": top_horse,
-            "partner_horses": partner_horses,
-            "top_odds": top_odds,
-            "budget": budget_amount,
-            "bias_str": bias_str
+        if front_bias:
+            active_biases.append(
+                "前残り"
+            )
+
+        if inside_bias:
+            active_biases.append(
+                "内枠"
+            )
+
+        if outer_bias:
+            active_biases.append(
+                "外差し"
+            )
+
+        if green_belt:
+            active_biases.append(
+                "グリーンベルト"
+            )
+
+        if g1_mode:
+            active_biases.append(
+                "G1サイン"
+            )
+
+        bias_text = (
+            ",".join(active_biases)
+            if active_biases
+            else "なし"
+        )
+
+        prediction_time = (
+            datetime.now()
+            .strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+        prediction_log_id = (
+            create_prediction_log_id(
+                fetched_info["race_id"],
+                prediction_time
+            )
+        )
+
+        st.session_state[
+            "latest_prediction"
+        ] = {
+
+            "prediction_log_id":
+                prediction_log_id,
+
+            "race_id":
+                fetched_info["race_id"],
+
+            "race_name":
+                fetched_info["race_name"],
+
+            "race_date":
+                fetched_info[
+                    "race_date"
+                ].strftime(
+                    "%Y-%m-%d"
+                ),
+
+            "predict_time":
+                prediction_time,
+
+            "data_fetched_at":
+                fetched_info[
+                    "fetched_at"
+                ].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+
+            "course":
+                f"{fetched_info['venue']}"
+                f"{track_type}",
+
+            "distance":
+                final_distance,
+
+            "condition":
+                condition,
+
+            "head_count":
+                len(horses),
+
+            "confidence":
+                confidence,
+
+            "result_df":
+                result_df,
+
+            "top_horse":
+                top_horse,
+
+            "partner_horses":
+                partner_horses,
+
+            "top_odds":
+                top_odds_value,
+
+            "budget":
+                budget,
+
+            "bias_text":
+                bias_text,
+
+            "odds_status":
+                fetched_info[
+                    "odds_status"
+                ],
+
+            "odds_coverage":
+                fetched_info[
+                    "odds_coverage"
+                ],
         }
 
-    latest = st.session_state["latest_prediction"]
-    if latest is not None:
-        st.markdown("### 📊 予想結果・モデル評価一覧")
-        st.dataframe(latest["res_df"], use_container_width=True)
-        
-        col_res1, col_res2 = st.columns(2)
-        with col_res1:
-            st.subheader(f"◎ 本命軸馬（相対シェア1位）: {latest['top_horse']}")
-            st.write(f"◯/▲ 相手馬（相対シェア2・3位）: {latest['partner_horses']}")
-            st.caption(f"適用バイアス: {latest['bias_str']}")
-        with col_res2:
-            st.subheader("💡 資金配分イメージ")
-            b_amt = latest["budget"]
-            st.write(f"本命馬券 (50%): {int(b_amt * 0.5)} 円")
-            st.write(f"相手馬券 (30%): {int(b_amt * 0.3)} 円")
-            st.write(f"抑え馬券 (20%): {int(b_amt * 0.2)} 円")
+        st.success(
+            "予想計算が完了しました。"
+        )
 
-        st.markdown("---")
-        if st.button("📥 この予想結果を履歴（CSV）に保存する"):
-            history_df = load_history_df()
-            save_race_id = latest["race_id"]
-            
-            existing_record = history_df[history_df["レースID"] == save_race_id]
-            if not existing_record.empty and existing_record.iloc[0]["確定フラグ"] == "確定":
-                st.warning("⚠️ このレースは既に「確定済」のため保護されています。")
-            else:
-                new_record = {
-                    "レースID": save_race_id,
-                    "レース名": latest["race_name"],
-                    "開催日": latest["race_date"],
-                    "予想日時": latest["predict_time"],
-                    "コース": latest["course"],
-                    "距離": latest["distance"],
-                    "馬場状態": latest["condition"],
-                    "出走頭数": latest["head_count"],
-                    "勝負度": latest["confidence"],
-                    "軸馬": latest["top_horse"],
-                    "相手馬": latest["partner_horses"],
-                    "単勝オッズ": latest["top_odds"],
-                    "バイアス履歴": latest["bias_str"],
-                    "モデルバージョン": VERSION,
-                    "確定フラグ": "未確定",
-                    "回収額": 0,
-                    "収支": 0,
-                    "メモ": "",
-                    "投資額": latest["budget"]
-                }
-                if not existing_record.empty:
-                    history_df = history_df[history_df["レースID"] != save_race_id]
-                
-                updated_df = pd.concat([history_df, pd.DataFrame([new_record])], ignore_index=True)
-                save_history_df(updated_df)
-                st.success(f"✅ {latest['race_name']} の予想結果を永続保存しました！")
+    latest = (
+        st.session_state.get(
+            "latest_prediction"
+        )
+    )
 
-# ==========================================
-# 5. 画面 2: 成績ダッシュボード・結果入力
-# ==========================================
-elif mode == "📊 成績ダッシュボード・結果入力":
-    st.header("📊 成績ダッシュボード & 確定回収率集計")
-    
-    df = load_history_df()
-    
-    confirmed_df = df[df["確定フラグ"] == "確定"] if not df.empty else pd.DataFrame()
-    
-    total_races = len(df)
-    confirmed_races = len(confirmed_df)
-    total_investment = confirmed_df["投資額"].astype(float).sum() if not confirmed_df.empty else 0
-    total_return = confirmed_df["回収額"].astype(float).sum() if not confirmed_df.empty else 0
-    total_balance = total_return - total_investment
-    recovery_rate = (total_return / total_investment * 100) if total_investment > 0 else 0.0
-    
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("総予想件数", f"{total_races} 件")
-    col_m2.metric("確定レース数", f"{confirmed_races} 件")
-    col_m3.metric("通算回収率", f"{recovery_rate:.1f} %")
-    col_m4.metric("累計収支", f"{int(total_balance):,} 円")
-    
-    st.markdown("---")
-    st.subheader("📝 未確定レースの払戻金入力・更新")
-    
-    unconfirmed_df = df[df["確定フラグ"] == "未確定"] if not df.empty else pd.DataFrame()
-    
-    if unconfirmed_df.empty:
-        st.info("現在、未確定のレースはありません。")
-    else:
-        with st.form("update_result_form"):
-            selected_race_id = st.selectbox(
-                "結果を入力するレースを選択",
-                options=unconfirmed_df["レースID"].tolist()
+    if latest:
+
+        st.markdown(
+            "### 📊 モデル評価"
+        )
+
+        st.caption(
+            "モデル確率は市場オッズを計算材料に使用せず、"
+            "モデル内部のスコアを正規化した値です。"
+            "Value Indexは、そのモデル確率と単勝オッズから"
+            "後段で計算しています。"
+        )
+
+        st.dataframe(
+            latest["result_df"],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+
+            st.subheader(
+                f"◎ モデル1位: "
+                f"{latest['top_horse']}"
             )
-            
-            race_detail = unconfirmed_df[unconfirmed_df["レースID"] == selected_race_id].iloc[0]
-            bias_info = race_detail.get('バイアス履歴', 'なし')
-            m_ver = race_detail.get('モデルバージョン', '旧Ver')
-            st.caption(f"対象: **{race_detail['開催日']} {race_detail['レース名']}** | 軸馬: **{race_detail['軸馬']}** | Ver: **{m_ver}** | 投資額: **{race_detail['投資額']}円**")
-            
-            input_return = st.number_input("回収額 / 払戻金 (円)", min_value=0, value=0, step=100)
-            input_memo = st.text_input("メモ (例: 単勝的中など)", value="")
-            
-            submit_update = st.form_submit_button("確定成績を保存")
-            
-            if submit_update:
-                idx = df[df["レースID"] == selected_race_id].index
-                if not idx.empty:
-                    inv = float(df.loc[idx[0], "投資額"])
-                    df.loc[idx[0], "確定フラグ"] = "確定"
-                    df.loc[idx[0], "回収額"] = input_return
-                    df.loc[idx[0], "収支"] = input_return - inv
-                    df.loc[idx[0], "メモ"] = input_memo
-                    
-                    save_history_df(df)
-                    st.success(f"✅ レース `{selected_race_id}` の確定成績を更新保存しました！")
-                    st.rerun()
 
-    st.markdown("---")
-    st.subheader("📋 全履歴ログ")
-    st.dataframe(df, use_container_width=True)
-    
+            st.write(
+                f"相手: {latest['partner_horses']}"
+            )
+
+        with r2:
+
+            st.subheader(
+                "📡 データ状態"
+            )
+
+            st.write(
+                f"オッズ: "
+                f"{latest['odds_status']}"
+            )
+
+            st.write(
+                f"取得率: "
+                f"{latest['odds_coverage']:.0%}"
+            )
+
+        with r3:
+
+            st.subheader(
+                "⚙️ 設定"
+            )
+
+            st.write(
+                f"勝負度: "
+                f"{latest['confidence']}"
+            )
+
+            st.write(
+                f"補正: "
+                f"{latest['bias_text']}"
+            )
+
+        st.markdown(
+            "### 💎 Value Index候補"
+        )
+
+        display_df = latest[
+            "result_df"
+        ].copy()
+
+        value_numeric = pd.to_numeric(
+            display_df[
+                "Value Index"
+            ],
+            errors="coerce"
+        )
+
+        value_candidates = (
+            display_df[
+                value_numeric > 1
+            ]
+            .copy()
+        )
+
+        if value_candidates.empty:
+
+            st.info(
+                "Value Index > 1.00 の馬はありません。"
+            )
+
+        else:
+
+            st.dataframe(
+                value_candidates,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.warning(
+            "⚠️ Value Index > 1.00 は、"
+            "モデル評価と市場オッズの比率が1を超えていることを示すだけで、"
+            "的中・利益・期待値を保証するものではありません。"
+        )
+
+        st.markdown(
+            "### 💰 参考資金配分"
+        )
+
+        budget_amount = float(
+            latest["budget"]
+        )
+
+        model_df = latest[
+            "result_df"
+        ].head(3).copy()
+
+        if len(model_df) > 0:
+
+            raw_weights = np.array(
+                [
+                    0.50,
+                    0.30,
+                    0.20
+                ][:len(model_df)],
+                dtype=float
+            )
+
+            raw_weights = (
+                raw_weights
+                / raw_weights.sum()
+            )
+
+            allocation_rows = []
+
+            for i, (_, row) in enumerate(
+                model_df.iterrows()
+            ):
+
+                allocation_rows.append(
+                    {
+                        "順位":
+                            i + 1,
+                        "馬名":
+                            row["馬名"],
+                        "モデル確率":
+                            row["モデル確率(%)"],
+                        "参考配分":
+                            int(
+                                budget_amount
+                                * raw_weights[i]
+                            )
+                    }
+                )
+
+            allocation_df = pd.DataFrame(
+                allocation_rows
+            )
+
+            st.dataframe(
+                allocation_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.caption(
+            "※ 上記はモデル順位に基づく固定比率の参考表示です。"
+            "Value Indexから利益を保証する資金配分ではありません。"
+        )
+
+        st.markdown(
+            "---"
+        )
+
+        if st.button(
+            "📥 この予想ログを保存",
+            use_container_width=True
+        ):
+
+            history_df = load_history_df()
+
+            new_record = {
+
+                "予測ログID":
+                    latest[
+                        "prediction_log_id"
+                    ],
+
+                "レースID":
+                    latest[
+                        "race_id"
+                    ],
+
+                "レース名":
+                    latest[
+                        "race_name"
+                    ],
+
+                "開催日":
+                    latest[
+                        "race_date"
+                    ],
+
+                "予想日時":
+                    latest[
+                        "predict_time"
+                    ],
+
+                "データ取得日時":
+                    latest[
+                        "data_fetched_at"
+                    ],
+
+                "コース":
+                    latest[
+                        "course"
+                    ],
+
+                "距離":
+                    latest[
+                        "distance"
+                    ],
+
+                "馬場状態":
+                    latest[
+                        "condition"
+                    ],
+
+                "出走頭数":
+                    latest[
+                        "head_count"
+                    ],
+
+                "勝負度":
+                    latest[
+                        "confidence"
+                    ],
+
+                "軸馬":
+                    latest[
+                        "top_horse"
+                    ],
+
+                "相手馬":
+                    latest[
+                        "partner_horses"
+                    ],
+
+                "軸馬オッズ":
+                    latest[
+                        "top_odds"
+                    ],
+
+                "バイアス履歴":
+                    latest[
+                        "bias_text"
+                    ],
+
+                "モデルバージョン":
+                    VERSION,
+
+                "確定フラグ":
+                    "未確定",
+
+                "回収額":
+                    0,
+
+                "収支":
+                    0,
+
+                "メモ":
+                    "",
+
+                "投資額":
+                    latest[
+                        "budget"
+                    ],
+
+                "オッズ状態":
+                    latest[
+                        "odds_status"
+                    ],
+
+                "オッズ取得率":
+                    latest[
+                        "odds_coverage"
+                    ],
+            }
+
+            if (
+                not history_df.empty
+                and
+                (
+                    history_df[
+                        "予測ログID"
+                    ]
+                    .astype(str)
+                    == str(
+                        latest[
+                            "prediction_log_id"
+                        ]
+                    )
+                ).any()
+            ):
+
+                st.warning(
+                    "この予測ログは既に保存されています。"
+                )
+
+            else:
+
+                updated_df = pd.concat(
+                    [
+                        history_df,
+                        pd.DataFrame(
+                            [new_record]
+                        )
+                    ],
+                    ignore_index=True
+                )
+
+                if save_history_df(
+                    updated_df
+                ):
+
+                    st.success(
+                        "✅ 予測ログを保存しました。"
+                    )
+
+
+# ============================================================
+# 15. 成績ダッシュボード
+# ============================================================
+
+elif mode == "📊 成績ダッシュボード・結果入力":
+
+    st.header(
+        "📊 成績ダッシュボード"
+    )
+
+    df = load_history_df()
+
+    if df.empty:
+
+        st.info(
+            "まだ予測履歴がありません。"
+        )
+
+        st.stop()
+
+    df = sanitize_df_types(
+        df
+    )
+
+    confirmed_df = df[
+        df["確定フラグ"] == "確定"
+    ].copy()
+
+    total_logs = len(df)
+
+    confirmed_logs = len(
+        confirmed_df
+    )
+
+    total_investment = (
+        confirmed_df[
+            "投資額"
+        ].astype(float).sum()
+        if not confirmed_df.empty
+        else 0
+    )
+
+    total_return = (
+        confirmed_df[
+            "回収額"
+        ].astype(float).sum()
+        if not confirmed_df.empty
+        else 0
+    )
+
+    total_balance = (
+        total_return
+        - total_investment
+    )
+
+    recovery_rate = (
+        total_return
+        / total_investment
+        * 100
+        if total_investment > 0
+        else 0
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric(
+        "予測ログ数",
+        f"{total_logs:,}"
+    )
+
+    m2.metric(
+        "確定ログ数",
+        f"{confirmed_logs:,}"
+    )
+
+    m3.metric(
+        "回収率",
+        f"{recovery_rate:.1f}%"
+    )
+
+    m4.metric(
+        "累計収支",
+        f"{int(total_balance):+,}円"
+    )
+
+    st.markdown(
+        "### 📡 オッズ状態別ログ"
+    )
+
+    if not df.empty:
+
+        odds_summary = (
+            df.groupby(
+                "オッズ状態"
+            )
+            .size()
+            .reset_index(
+                name="件数"
+            )
+        )
+
+        st.dataframe(
+            odds_summary,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.markdown(
+        "---"
+    )
+
+    st.subheader(
+        "📝 未確定ログの結果入力"
+    )
+
+    unconfirmed_df = df[
+        df["確定フラグ"] == "未確定"
+    ].copy()
+
+    if unconfirmed_df.empty:
+
+        st.info(
+            "現在、未確定ログはありません。"
+        )
+
+    else:
+
+        with st.form(
+            "result_update_form"
+        ):
+
+            options = []
+
+            for _, row in (
+                unconfirmed_df.iterrows()
+            ):
+
+                options.append(
+                    f"{row['予測ログID']} | "
+                    f"{row['開催日']} | "
+                    f"{row['レース名']} | "
+                    f"{row['予想日時']} | "
+                    f"{row['オッズ状態']}"
+                )
+
+            selected_option = st.selectbox(
+                "結果を入力する予測ログ",
+                options
+            )
+
+            selected_position = (
+                options.index(
+                    selected_option
+                )
+            )
+
+            selected_row = (
+                unconfirmed_df
+                .iloc[
+                    selected_position
+                ]
+            )
+
+            st.caption(
+                f"レース: "
+                f"**{selected_row['レース名']}** "
+                f"| 軸: **{selected_row['軸馬']}** "
+                f"| 投資: "
+                f"**{selected_row['投資額']}円**"
+            )
+
+            input_return = st.number_input(
+                "回収額 / 払戻金",
+                min_value=0,
+                value=0,
+                step=100
+            )
+
+            input_memo = st.text_input(
+                "メモ",
+                value=""
+            )
+
+            submit = st.form_submit_button(
+                "確定成績を保存"
+            )
+
+            if submit:
+
+                target_log_id = (
+                    selected_row[
+                        "予測ログID"
+                    ]
+                )
+
+                match_idx = df[
+                    df["予測ログID"]
+                    .astype(str)
+                    ==
+                    str(target_log_id)
+                ].index
+
+                if match_idx.empty:
+
+                    st.error(
+                        "対象ログが見つかりません。"
+                    )
+
+                else:
+
+                    idx = match_idx[0]
+
+                    investment = float(
+                        df.loc[
+                            idx,
+                            "投資額"
+                        ]
+                    )
+
+                    df.loc[
+                        idx,
+                        "確定フラグ"
+                    ] = "確定"
+
+                    df.loc[
+                        idx,
+                        "回収額"
+                    ] = input_return
+
+                    df.loc[
+                        idx,
+                        "収支"
+                    ] = (
+                        input_return
+                        - investment
+                    )
+
+                    df.loc[
+                        idx,
+                        "メモ"
+                    ] = input_memo
+
+                    if save_history_df(
+                        df
+                    ):
+
+                        st.success(
+                            "✅ 確定成績を保存しました。"
+                        )
+
+                        st.rerun()
+
+    st.markdown(
+        "---"
+    )
+
+    st.subheader(
+        "📋 全予測ログ"
+    )
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True
+    )
+
     st.download_button(
-        label="📥 最新ログ（CSV）をPCにダウンロード",
-        data=df.to_csv(index=False, encoding="utf-8-sig"),
+        label="📥 CSVをダウンロード",
+        data=df.to_csv(
+            index=False,
+            encoding="utf-8-sig"
+        ),
         file_name=CSV_FILENAME,
-        mime="text/csv"
+        mime="text/csv",
+        use_container_width=True
     )
