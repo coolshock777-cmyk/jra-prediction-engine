@@ -699,26 +699,76 @@ def extract_style_from_past_html_robust(
     horse_number: int,
     horse_name: str,
 ) -> str:
-    """過去走ページをHTML構造に依存せず脚質抽出する最終フォールバック。"""
+    """
+    過去走ページから脚質を強制的に拾う最終フォールバック。
+
+    現行netkeibaでは脚質が画面テキストではなく、imgのalt/titleや
+    「Image先中13週」のような属性文字列に入るケースがあるため、
+    BeautifulSoupのget_text()だけに依存しない。
+    馬名・馬番の周辺HTMLを調べ、属性を含む生HTMLから抽出する。
+    """
     if not html:
         return "不明"
 
-    soup = BeautifulSoup(html, "html.parser")
-    pattern = re.compile(r"(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)")
+    raw = str(html)
+    soup = BeautifulSoup(raw, "html.parser")
     target_name = normalize_text(horse_name)
 
-    for row in soup.find_all("tr"):
-        text = normalize_text(row.get_text(" ", strip=True))
-        if not text:
-            continue
-        number_hit = re.search(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", text)
-        name_hit = bool(target_name and target_name in text)
-        if not (number_hit or name_hit):
-            continue
+    style_pattern = re.compile(
+        r"(?:Image)?(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|\b)",
+        re.I,
+    )
 
-        m = pattern.search(text)
+    def search_chunk(chunk: str) -> str:
+        chunk = normalize_text(chunk)
+        if not chunk:
+            return "不明"
+        m = style_pattern.search(chunk)
         if m:
             return m.group(1)
+        return extract_style_from_text(chunk)
+
+    # 1) 馬名を含む最小要素（tr -> div -> td 等）を優先。
+    name_candidates = []
+    if target_name:
+        for tag in soup.find_all(string=re.compile(re.escape(target_name), re.I)):
+            parent = tag.parent
+            for _ in range(6):
+                if parent is None:
+                    break
+                txt = normalize_text(parent.get_text(" ", strip=True))
+                if target_name in txt and len(txt) <= 5000:
+                    name_candidates.append(parent)
+                parent = parent.parent
+
+    for node in name_candidates:
+        # ノード自身 + 祖先の属性を含めて調べる。
+        html_text = str(node)
+        style = search_chunk(html_text)
+        if style != "不明":
+            return style
+        for tag in node.find_all(True):
+            values = [tag.get("alt", ""), tag.get("title", ""), tag.get("aria-label", "")]
+            for attr, value in tag.attrs.items():
+                if str(attr).lower().startswith("data-"):
+                    values.append(str(value))
+            for value in values:
+                style = search_chunk(str(value))
+                if style != "不明":
+                    return style
+
+    # 2) 馬番に一致する行。class名が変わってもテキスト/属性を総当たり。
+    rows = soup.find_all("tr")
+    for row in rows:
+        text = normalize_text(row.get_text(" ", strip=True))
+        num_hit = bool(re.search(rf"(?:^|\\s){re.escape(str(horse_number))}(?:\\s|$)", text))
+        name_hit = bool(target_name and target_name in text)
+        if not (num_hit or name_hit):
+            continue
+
+        style = search_chunk(str(row))
+        if style != "不明":
+            return style
 
         for tag in row.find_all(True):
             values = [tag.get("alt", ""), tag.get("title", ""), tag.get("aria-label", "")]
@@ -726,22 +776,22 @@ def extract_style_from_past_html_robust(
                 if str(attr).lower().startswith("data-"):
                     values.append(str(value))
             for value in values:
-                m = pattern.search(normalize_text(str(value)))
-                if m:
-                    return m.group(1)
+                style = search_chunk(str(value))
+                if style != "不明":
+                    return style
 
-    plain = normalize_text(soup.get_text(" ", strip=True))
+    # 3) 生HTML上で馬名/馬番の前後を直接検索。
+    anchors = []
     if target_name:
-        pos = plain.find(target_name)
-        if pos >= 0:
-            m = pattern.search(plain[max(0, pos-300):pos+1800])
-            if m:
-                return m.group(1)
+        anchors.extend(m.start() for m in re.finditer(re.escape(target_name), normalize_text(raw), re.I))
+    anchors.extend(m.start() for m in re.finditer(rf"(?:^|\\s){re.escape(str(horse_number))}(?:\\s|$)", normalize_text(raw)))
 
-    for mpos in [m.start() for m in re.finditer(rf"(?:^|\s){re.escape(str(horse_number))}(?:\s|$)", plain)]:
-        m = pattern.search(plain[max(0, mpos-150):mpos+1800])
-        if m:
-            return m.group(1)
+    normalized_raw = normalize_text(raw)
+    for pos in anchors:
+        chunk = normalized_raw[max(0, pos - 1000): pos + 4000]
+        style = search_chunk(chunk)
+        if style != "不明":
+            return style
 
     return "不明"
 
@@ -760,6 +810,22 @@ def extract_style_from_past_page(
 
     if row is None:
         return "不明"
+
+    # 属性値に「Image先中13週」等が入っているケースを先に確認。
+    raw_row = str(row)
+    raw_style = extract_style_from_text(raw_row)
+    if raw_style != "不明":
+        return raw_style
+
+    for tag in row.find_all(True):
+        values = [tag.get("alt", ""), tag.get("title", ""), tag.get("aria-label", "")]
+        for attr, value in tag.attrs.items():
+            if str(attr).lower().startswith("data-"):
+                values.append(str(value))
+        for value in values:
+            raw_style = extract_style_from_text(str(value))
+            if raw_style != "不明":
+                return raw_style
 
     text = normalize_text(
         row.get_text(" ", strip=True)
@@ -1274,6 +1340,14 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         except Exception:
             race_num = 0
 
+        # race_id先頭4桁を開催年として使う。
+        # RaceData02に年が表示されない場合でも、サーバー時刻ではなく
+        # レースIDから正しい開催日を復元できるようにする。
+        try:
+            race_year = int(race_id[:4])
+        except Exception:
+            race_year = datetime.now().year
+
         extracted = {
             "race_id": race_id,
             "venue": detected_venue,
@@ -1282,7 +1356,7 @@ def fetch_netkeiba_race_data_cached(race_id: str):
             "distance": "その他",
             "condition": "良",
             "race_name": f"レース_{race_id}",
-            "race_date": datetime.now(),
+            "race_date": datetime(race_year, 1, 1),
             "horses": [],
             "kyaku_count": 0,
             "front_runner_count": 0,
@@ -1304,17 +1378,26 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 race_data_02.get_text(" ", strip=True)
             )
 
+            # 年あり表記を優先。
             date_match = re.search(
                 r"(\d{4})年(\d{1,2})月(\d{1,2})日",
                 date_text,
             )
 
             if date_match:
-                y, m, d = map(
-                    int,
-                    date_match.groups(),
-                )
+                y, m, d = map(int, date_match.groups())
                 extracted["race_date"] = datetime(y, m, d)
+            else:
+                # JRA/netkeibaでは「10月3日(土)」のように年が省略される
+                # ことがある。年をサーバー時刻から取ると日本時間との
+                # 日付境界で前日になるため、race_idの年を使う。
+                md_match = re.search(
+                    r"(\d{1,2})月(\d{1,2})日",
+                    date_text,
+                )
+                if md_match:
+                    m, d = map(int, md_match.groups())
+                    extracted["race_date"] = datetime(race_year, m, d)
 
         # ----------------------------------------------------
         # レース名
