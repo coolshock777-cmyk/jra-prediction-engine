@@ -94,10 +94,11 @@ def get_gdrive_service():
         # st.secrets 取得 & 辞書化
         creds_dict = dict(st.secrets["gcp_service_account"])
         
-        # private_key の改行コード多角補正（エスケープ文字列・実際の改行双方に対応）
+        # private_key の完全自動整形ロジック（改行コードの表記ゆれを強力補正）
         if "private_key" in creds_dict:
-            pk = creds_dict["private_key"]
-            pk = pk.replace('\\n', '\n').replace('\\\\n', '\n')
+            pk = str(creds_dict["private_key"])
+            pk = pk.replace('\\\\n', '\n').replace('\\n', '\n')
+            pk = pk.strip('"').strip("'").strip()
             creds_dict["private_key"] = pk
             
         # google-auth による現代的認証処理
@@ -368,7 +369,7 @@ if mode == "🏇 リアルタイム予想":
 # 5. 画面 2: 成績ダッシュボード・結果入力
 # ==========================================
 elif mode == "📊 成績ダッシュボード・結果入力":
-    st.header("📊 成績ダッシュボード & 確定回収率集計")
+    st.header("📊 成績ダッシュボード & 確定回収率集集")
     
     df = load_history_df()
     
