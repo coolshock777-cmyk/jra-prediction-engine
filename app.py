@@ -86,27 +86,23 @@ def parse_distance_from_text(text: str) -> str:
     return "その他"
 
 def get_gdrive_service():
-    """Secrets設定からPyDrive2経由でGoogle Driveインスタンスを取得"""
+    """Secrets設定からgoogle-auth + PyDrive2経由でGoogle Driveインスタンスを取得"""
     try:
         gauth = GoogleAuth()
         gauth.credentials = None
         
-        creds_dict = {
-            "type": st.secrets["gcp_service_account"]["type"],
-            "project_id": st.secrets["gcp_service_account"]["project_id"],
-            "private_key_id": st.secrets["gcp_service_account"]["private_key_id"],
-            "private_key": st.secrets["gcp_service_account"]["private_key"].replace('\\n', '\n'),
-            "client_email": st.secrets["gcp_service_account"]["client_email"],
-            "client_id": st.secrets["gcp_service_account"]["client_id"],
-            "auth_uri": st.secrets["gcp_service_account"]["auth_uri"],
-            "token_uri": st.secrets["gcp_service_account"]["token_uri"],
-            "auth_provider_x509_cert_url": st.secrets["gcp_service_account"]["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": st.secrets["gcp_service_account"]["client_x509_cert_url"]
-        }
+        # st.secrets 取得 & 辞書化
+        creds_dict = dict(st.secrets["gcp_service_account"])
         
-        from oauth2client.service_account import ServiceAccountCredentials
+        # 改行文字の補正処理
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+            
+        # google-auth による現代的認証 (oauth2clientの依存・OpenSSLエラーを解消)
+        from google.oauth2.service_account import Credentials
         scope = ["https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        
         gauth.credentials = creds
         drive = GoogleDrive(gauth)
         return drive
@@ -434,10 +430,5 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         st.subheader("📋 全履歴ログ")
         st.dataframe(df, use_container_width=True)
         
-        # CSVダウンロードボタン (Ver.1.01で追加)
+        # CSVダウンロードボタン
         st.download_button(
-            label="📥 最新ログ（CSV）をダウンロード",
-            data=df.to_csv(index=False, encoding="utf-8-sig"),
-            file_name=CSV_FILENAME,
-            mime="text/csv"
-        )
