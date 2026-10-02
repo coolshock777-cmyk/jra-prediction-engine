@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.14"
+VERSION = "Ver.2.15"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -496,42 +496,27 @@ def extract_style_from_row(row) -> str:
 
 
 def extract_style_from_text(text: str) -> str:
-    """netkeibaの「逃中2週」「先中3週」等から脚質を抽出する。"""
-    text = normalize_text(text)
+    """netkeibaの脚質表記を幅広く抽出する。
 
+    実ページでは「Image差中14週」のように検索結果上は見える一方、
+    HTML取得時には「差中14週」「差 中14週」「差」などに分解される
+    ケースがあるため、Imageの有無や空白を許容する。
+    """
+    text = normalize_text(text)
     if not text:
         return "不明"
 
-    # 「Image先中13週」のような連結表記を最優先。
-    match = re.search(
-        r"Image(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
-        text,
-    )
-    if match:
-        return match.group(1)
+    patterns = [
+        r"(?:Image)?\s*(逃|先|差|追)\s*(?:中\d+週|中\d+ヶ月|初出走)",
+        r"(?:脚質|style|kyaku|running)[^逃先差追]{0,30}(逃|先|差|追)",
+        r"(?<![逃先差追])(逃|先|差|追)\s*(?:中\s*\d+\s*週|中\s*\d+\s*ヶ月)",
+    ]
 
-    # 通常の脚質記号 + 休養期間
-    match = re.search(
-        r"(?:^|\s)(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
-        text,
-    )
-    if match:
-        return match.group(1)
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return m.group(1)
 
-    # 「逃中2週」のような連結文字列を直接検索
-    match = re.search(
-        r"(逃|先|差|追)中(?:\d+週|\d+ヶ月)",
-        text,
-    )
-    if match:
-        return match.group(1)
-
-    # 新馬などで「初出走」と付く場合
-    match = re.search(r"(逃|先|差|追)初出走", text)
-    if match:
-        return match.group(1)
-
-    # 説明文や別形式へのフォールバック
     if re.search(r"逃げ", text):
         return "逃"
     if re.search(r"先行", text):
@@ -1068,47 +1053,31 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         # ----------------------------------------------------
         # 脚質・オッズ補完用の過去走ページ
         # ----------------------------------------------------
-        past_soup = None
+        past_soups = []
 
-        try:
-            past_response = session.get(
-                past_url,
-                headers={**REQUEST_HEADERS, "Referer": url},
-                timeout=20,
-            )
-            past_response.raise_for_status()
-            past_response.encoding = (
-                past_response.apparent_encoding
-                or past_response.encoding
-                or "euc-jp"
-            )
-            past_soup = BeautifulSoup(
-                past_response.text,
-                "html.parser",
-            )
-
-            if not past_soup.find("tr"):
-                fallback_past_url = (
-                    "https://race.netkeiba.com/race/"
-                    f"shutuba_past.html?race_id={race_id}"
-                )
-                fallback_response = session.get(
-                    fallback_past_url,
+        for past_url in past_urls:
+            try:
+                past_response = session.get(
+                    past_url,
                     headers={**REQUEST_HEADERS, "Referer": url},
                     timeout=20,
                 )
-                fallback_response.raise_for_status()
-                fallback_response.encoding = (
-                    fallback_response.apparent_encoding
-                    or fallback_response.encoding
+                past_response.raise_for_status()
+                past_response.encoding = (
+                    past_response.apparent_encoding
+                    or past_response.encoding
                     or "euc-jp"
                 )
-                past_soup = BeautifulSoup(
-                    fallback_response.text,
+                candidate_soup = BeautifulSoup(
+                    past_response.text,
                     "html.parser",
                 )
-        except Exception:
-            past_soup = None
+                if candidate_soup.find("tr"):
+                    past_soups.append(candidate_soup)
+            except Exception:
+                continue
+
+        past_soup = past_soups[0] if past_soups else None
 
         # オッズはHTMLの ---.- プレースホルダではなく、
         # netkeibaの単勝オッズJSON APIから取得する。
@@ -1169,32 +1138,58 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     else "未取得"
                 )
 
-                # 第2段階: 過去走ページの標準構造から取得。
-                if style == "不明" and past_soup is not None:
+                # 第2段階: 5走表示/9走表示の両ページを順番に確認。
+                for candidate_soup in past_soups:
+                    if style != "不明":
+                        break
+
                     past_style = extract_style_from_past_page(
-                        past_soup,
+                        candidate_soup,
                         uma,
                         horse_name,
                     )
-
                     if past_style != "不明":
                         style = past_style
-                        style_source = "過去走"
+                        style_source = "過去走・脚質表記"
 
-                # 第3段階: class名やHTML構造が変わっていても、
-                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
-                if style == "不明" and past_soup is not None:
-                    inferred_style = (
-                        extract_style_from_any_past_horse_text(
-                            past_soup,
-                            uma,
-                            horse_name,
+                # 第3段階: 馬名の前後2500文字を直接解析。
+                # netkeibaの実ページでは「Image差中14週」等が
+                # 馬名付近に表示されるため、行構造に依存しない。
+                if style == "不明":
+                    for candidate_soup in past_soups:
+                        if style != "不明":
+                            break
+                        full_text = normalize_text(
+                            candidate_soup.get_text(" ", strip=True)
                         )
-                    )
+                        target = normalize_text(horse_name)
+                        pos = full_text.find(target) if target else -1
+                        if pos >= 0:
+                            chunk = full_text[
+                                max(0, pos - 150):
+                                pos + 800
+                            ]
+                            direct = extract_style_from_text(chunk)
+                            if direct != "不明":
+                                style = direct
+                                style_source = "過去走・馬名周辺"
 
-                    if inferred_style != "不明":
-                        style = inferred_style
-                        style_source = "過去走・通過順位推定"
+                # 第4段階: class名やHTML構造が変わっていても、
+                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
+                if style == "不明":
+                    for candidate_soup in past_soups:
+                        if style != "不明":
+                            break
+                        inferred_style = (
+                            extract_style_from_any_past_horse_text(
+                                candidate_soup,
+                                uma,
+                                horse_name,
+                            )
+                        )
+                        if inferred_style != "不明":
+                            style = inferred_style
+                            style_source = "過去走・通過順位推定"
 
                 style_display = {
                     "逃": "逃げ",
@@ -1929,7 +1924,8 @@ if mode == "🏇 リアルタイム予想":
                     if horse.get("斤量") is not None
                     else np.nan
                 ),
-                "脚質": str(horse.get("脚質") or "不明"),
+                "脚質": str(horse.get("脚質表示") or horse.get("脚質") or "不明"),
+                "脚質取得元": str(horse.get("脚質取得元") or "未取得"),
                 "単勝オッズ": (
                     float(odds)
                     if odds is not None
