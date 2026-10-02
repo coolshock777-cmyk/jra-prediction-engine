@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.10"
+VERSION = "Ver.2.11"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -446,9 +446,17 @@ def extract_style_from_text(text: str) -> str:
     if not text:
         return "不明"
 
-    # 最優先: 脚質記号 + 休養期間
+    # 「Image先中13週」のような連結表記を最優先。
     match = re.search(
-        r"(?:^|\s|Image)(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
+        r"Image(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
+        text,
+    )
+    if match:
+        return match.group(1)
+
+    # 通常の脚質記号 + 休養期間
+    match = re.search(
+        r"(?:^|\s)(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走|$)",
         text,
     )
     if match:
@@ -976,28 +984,29 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                 if odds is None:
                     odds = extract_odds_from_row(row)
 
-                # 脚質は過去走を複数走集計して代表値を決定。
-                style = "不明"
-                style_source = "未取得"
+                # 現在の出馬表の馬行から脚質を最優先で取得。
+                # netkeibaでは「Image先中13週」のように
+                # 馬行内へ現在脚質が直接記載される。
+                style = extract_style_from_text(
+                    row.get_text(" ", strip=True)
+                )
+                style_source = (
+                    "出馬表・脚質欄"
+                    if style != "不明"
+                    else "未取得"
+                )
 
-                if past_soup is not None:
-                    style = extract_style_from_past_page(
+                # 現在の出馬表で取れない場合だけ過去走ページを補完。
+                if style == "不明" and past_soup is not None:
+                    past_style = extract_style_from_past_page(
                         past_soup,
                         uma,
                         horse_name,
                     )
 
-                    if style != "不明":
-                        style_source = "過去走複数走"
-
-                # 過去走で取れない場合のみ出馬表から補完
-                if style == "不明":
-                    style = extract_style_from_text(
-                        row.get_text(" ", strip=True)
-                    )
-
-                    if style != "不明":
-                        style_source = "出馬表"
+                    if past_style != "不明":
+                        style = past_style
+                        style_source = "過去走"
 
                 style_display = {
                     "逃": "逃げ",
