@@ -389,6 +389,20 @@ def extract_number_by_class(row, pattern):
     return 0
 
 
+def extract_waku_uma_fallback(row):
+    """class名が変わった出馬表行から枠番・馬番を補完する。"""
+    nums = []
+    for td in row.find_all("td"):
+        txt = normalize_text(td.get_text(" ", strip=True))
+        if re.fullmatch(r"\d{1,2}", txt):
+            n = int(txt)
+            if 1 <= n <= 18:
+                nums.append(n)
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    return 0, 0
+
+
 def extract_horse_name(row) -> str:
     selectors = [
         "span.HorseName",
@@ -1282,7 +1296,7 @@ REQUEST_HEADERS = {
     ttl=30,
     show_spinner=False,
 )
-def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
+def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refresh_token: str = ""):
     url = (
         "https://race.netkeiba.com/race/"
         f"shutuba.html?race_id={race_id}"
@@ -1498,6 +1512,22 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
             class_="HorseList",
         )
 
+        # ----------------------------------------------------
+        # 出馬表HTMLのフォールバック
+        # ----------------------------------------------------
+        # netkeiba側のHTML/CSS変更や一時的な部分HTMLで
+        # HorseList が一部しか返らない場合に備え、
+        # 馬DBリンクを持つ行も候補にする。
+        # 東京1Rのような15頭立てを3頭だけ取得するケースを防ぐ。
+        if len(horse_rows) < 5:
+            fallback_rows = []
+            for tr in soup.find_all("tr"):
+                if tr.find("a", href=re.compile(r"/horse/")):
+                    fallback_rows.append(tr)
+
+            if len(fallback_rows) > len(horse_rows):
+                horse_rows = fallback_rows
+
         if not horse_rows:
             return None, (
                 "出走馬テーブルが見つかりませんでした。"
@@ -1518,6 +1548,12 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = ""):
                     row,
                     r"Umaban",
                 )
+
+                if uma <= 0:
+                    fb_waku, fb_uma = extract_waku_uma_fallback(row)
+                    if fb_uma > 0:
+                        waku = fb_waku
+                        uma = fb_uma
 
                 if uma <= 0:
                     continue
@@ -1719,7 +1755,8 @@ def fetch_netkeiba_race_data(race_id_or_url, requested_date=None):
             requested_date_text = pd.Timestamp(requested_date).strftime("%Y-%m-%d")
         except Exception:
             requested_date_text = str(requested_date)
-    return fetch_netkeiba_race_data_cached(race_id, requested_date_text)
+    refresh_token = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return fetch_netkeiba_race_data_cached(race_id, requested_date_text, refresh_token)
 
 
 # ============================================================
