@@ -927,6 +927,56 @@ def fetch_win_odds_api(session, race_id: str):
 # ============================================================
 
 JRA_LEADING_URL = "https://www.jra.go.jp/datafile/leading/"
+JRA_LEADING_JOCKEY_URL = "https://jra.jp/JRAEN/AP/leading/jockeys"
+JRA_LEADING_TRAINER_URL = "https://jra.jp/JRAEN/AP/leading/trainers"
+
+# JRA公式の英語リーディング画面は現在の年度・最新成績を安定して返すため、
+# 日本語の出馬表名との照合用に主要騎手・調教師の公式表記対応を用意する。
+# 未登録名はそのまま未照合とし、リーディング取得自体を失敗扱いにはしない。
+JRA_EN_NAME_MAP = {
+    # jockeys
+    "Christophe Lemaire": "C.ルメール",
+    "Mirai Iwata": "岩田 望来",
+    "Kohei Matsuyama": "松山 弘平",
+    "Takeshi Yokoyama": "横山 武史",
+    "Yuga Kawada": "川田 将雅",
+    "Ryusei Sakai": "坂井 瑠星",
+    "Atsuya Nishimura": "西村 淳也",
+    "Yuji Tannai": "丹内 祐次",
+    "Keita Tosaki": "戸崎 圭太",
+    "Kazuo Yokoyama": "横山 和生",
+    "Kiwamu Ogino": "荻野 極",
+    "Yutaka Take": "武 豊",
+    "Arata Saito": "斎藤 新",
+    "Akihide Tsumura": "津村 明秀",
+    "Katsuma Sameshima": "鮫島 克駿",
+    "Kosei Miura": "三浦 皇成",
+    "Yuichi Kitamura": "北村 友一",
+    "Osuke Tayama": "田山 旺佑",
+    "Seinosuke Yoshimura": "吉村 誠之助",
+    "Rui Funayama": "舟山 瑠泉",
+    # trainers
+    "Haruki Sugiyama": "杉山 晴紀",
+    "Yoshito Yahagi": "矢作 芳人",
+    "Makoto Saito": "斎藤 誠",
+    "Masahiro Otake": "大竹 正博",
+    "Yasutoshi Ikee": "池江 泰寿",
+    "Takahisa Tezuka": "手塚 貴久",
+    "Hideaki Fujiwara": "藤原 英昭",
+    "Ryo Terashima": "寺島 良",
+    "Eiji Nakadate": "中舘 英二",
+    "Yuichi Shikato": "鹿戸 雄一",
+    "Yuichi Fukunaga": "福永 祐一",
+    "Keisuke Miyata": "宮田 敬介",
+    "Takashi Saito": "斎藤 崇史",
+    "Tomokazu Takano": "高野 友和",
+    "Shizuya Kato": "加藤 士津八",
+    "Keizo Ito": "伊藤 圭三",
+    "Yukihiro Kato": "加藤 征弘",
+    "Hiroyuki Uemura": "上村 洋行",
+    "Yutaka Okumura": "奥村 豊",
+    "Yasuo Tomomichi": "友道 康夫",
+}
 
 
 def normalize_person_name(value) -> str:
@@ -949,69 +999,74 @@ def _flatten_columns(df):
     return df
 
 
-def _parse_leading_table(df, person_kind):
-    """JRAリーディング表から人物名→統計を抽出。"""
+def _parse_english_leading_table(df):
+    """JRA公式英語リーディング表を順位データへ変換。"""
     if df is None or df.empty:
-        return {}
-
+        return []
     df = _flatten_columns(df.copy())
-    cols = [str(c) for c in df.columns]
-
-    if person_kind == "jockey":
-        name_col = next((c for c in cols if "騎手" in c), None)
-    else:
-        name_col = next((c for c in cols if "調教師" in c), None)
-
-    if name_col is None:
-        # 見出しが崩れている場合は2列目を人物名候補にする
-        name_col = cols[1] if len(cols) > 1 else None
-
-    if name_col is None:
-        return {}
-
-    rank_col = next((c for c in cols if "順位" in c), None)
-    wins_col = next((c for c in cols if "1着" in c or "勝利" in c), None)
-    rides_col = next((c for c in cols if "騎乗" in c or "出走" in c), None)
-    winrate_col = next((c for c in cols if "勝率" in c), None)
-    placate_col = next((c for c in cols if "入着率" in c or "3着内率" in c), None)
-
-    result = {}
+    rows = []
     for _, row in df.iterrows():
-        name_raw = row.get(name_col, "")
-        name = normalize_person_name(name_raw)
-        if not name or name in {"騎手名", "調教師名"}:
+        values = [str(v).strip() for v in row.tolist()]
+        if len(values) < 3:
             continue
+        rank_m = re.search(r"^\s*(\d+)\s*$", values[0])
+        if not rank_m:
+            continue
+        rank = int(rank_m.group(1))
+        name = values[1]
+        if not name or name.lower() in {"name", "jockey", "trainer"}:
+            continue
+        nums = []
+        for v in values[2:]:
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", v.replace(",", ""))
+            nums.append(float(m.group()) if m else None)
+        wins = nums[6] if len(nums) > 6 else None
+        rides = nums[7] if len(nums) > 7 else None
+        win_rate = nums[8] if len(nums) > 8 else None
+        top3_rate = nums[10] if len(nums) > 10 else None
+        rows.append({
+            "rank": rank,
+            "wins": wins,
+            "rides": rides,
+            "win_rate": win_rate,
+            "place_rate": top3_rate,
+            "raw_name": name,
+        })
+    return rows
 
-        def num(col):
-            if not col:
-                return None
-            v = row.get(col)
-            if pd.isna(v):
-                return None
-            m = re.search(r"[-+]?\d+(?:\.\d+)?", str(v).replace(",", ""))
-            return float(m.group()) if m else None
 
-        rank = num(rank_col)
-        if rank is None:
-            # 行順を順位として利用
-            rank = float(len(result) + 1)
-
-        result[name] = {
-            "rank": int(rank),
-            "wins": num(wins_col),
-            "rides": num(rides_col),
-            "win_rate": num(winrate_col),
-            "place_rate": num(placate_col),
-            "raw_name": str(name_raw),
-        }
-
+def _fetch_jra_english_leading(url, kind, headers):
+    """JRA公式英語ランキング画面を取得。ページは現在年度を表示する。"""
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    tables = pd.read_html(io.StringIO(r.text))
+    result = {}
+    rows = []
+    for table in tables:
+        parsed = _parse_english_leading_table(table)
+        if len(parsed) > len(rows):
+            rows = parsed
+    for item in rows:
+        en_name = item["raw_name"]
+        jp_name = JRA_EN_NAME_MAP.get(en_name)
+        # 対応表にない人物は英語名を別キーでも保持する。
+        # これにより取得成功とデータ欠損を明確に分離する。
+        key = normalize_person_name(jp_name or en_name)
+        item = dict(item)
+        item["jra_english_name"] = en_name
+        item["matched_japanese_name"] = jp_name or ""
+        result[key] = item
     return result
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_latest_jra_leading():
-    """JRA公式の『最新リーディング情報』から騎手・調教師を取得。
-    年度を固定せず、JRA公式トップ→埋め込みページを順番に解析する。
+    """JRA公式の最新リーディングを取得する。
+
+    日本語のトップページは内部表示部分が動的に構成されるため、
+    現在安定して取得できるJRA公式英語ランキング画面をデータ源にする。
+    画面自体が2026年など現在年度のランキングを返すため、年度を固定しない。
     """
     headers = {
         "User-Agent": (
@@ -1021,123 +1076,46 @@ def fetch_latest_jra_leading():
         ),
         "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
     }
-
     current_year = datetime.now().year
-    urls = [JRA_LEADING_URL]
-
-    try:
-        r = requests.get(JRA_LEADING_URL, headers=headers, timeout=20)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding or r.encoding or "utf-8"
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # JRAの最新ページは表示用iframeを使う場合があるため、srcを収集。
-        for iframe in soup.find_all("iframe"):
-            src = iframe.get("src")
-            if src:
-                if src.startswith("/"):
-                    src = "https://www.jra.go.jp" + src
-                elif src.startswith("http"):
-                    pass
-                else:
-                    src = "https://www.jra.go.jp/datafile/leading/" + src
-                if src not in urls:
-                    urls.append(src)
-    except Exception:
-        pass
-
-    # 年度固定ではなく、万一iframeが取れない場合のJRA公式フォールバック。
-    urls.extend([
-        f"https://www.jra.go.jp/datafile/leading/j{current_year}.html",
-        f"https://www.jra.go.jp/datafile/leading/{current_year}.html",
-    ])
-
     jockeys = {}
     trainers = {}
-    used_url = None
+    errors = []
 
-    for url in urls:
-        try:
-            rr = requests.get(url, headers=headers, timeout=20)
-            rr.raise_for_status()
-            rr.encoding = rr.apparent_encoding or rr.encoding or "utf-8"
-            html = rr.text
+    try:
+        jockeys = _fetch_jra_english_leading(
+            JRA_LEADING_JOCKEY_URL, "jockey", headers
+        )
+    except Exception as e:
+        errors.append(f"騎手: {e}")
 
-            tables = []
-            try:
-                tables = pd.read_html(io.StringIO(html))
-            except Exception:
-                tables = []
+    try:
+        trainers = _fetch_jra_english_leading(
+            JRA_LEADING_TRAINER_URL, "trainer", headers
+        )
+    except Exception as e:
+        errors.append(f"調教師: {e}")
 
-            for table in tables:
-                flat = _flatten_columns(table.copy())
-                cols_text = " ".join(str(c) for c in flat.columns)
-                if "騎手" in cols_text:
-                    parsed = _parse_leading_table(flat, "jockey")
-                    if len(parsed) >= len(jockeys):
-                        jockeys = parsed
-                if "調教師" in cols_text:
-                    parsed = _parse_leading_table(flat, "trainer")
-                    if len(parsed) >= len(trainers):
-                        trainers = parsed
-
-            # pandasで見出しを拾えない場合、HTMLのtableを直接解析。
-            if not jockeys or not trainers:
-                soup2 = BeautifulSoup(html, "html.parser")
-                for table in soup2.find_all("table"):
-                    rows = []
-                    for tr in table.find_all("tr"):
-                        cells = [normalize_text(x.get_text(" ", strip=True)) for x in tr.find_all(["th", "td"])]
-                        if cells:
-                            rows.append(cells)
-                    if len(rows) < 2:
-                        continue
-                    header_text = " ".join(rows[0])
-                    if "騎手" in header_text and not jockeys:
-                        # 最低限、順位・名前を抽出
-                        for cells in rows[1:]:
-                            if len(cells) >= 2:
-                                rank_m = re.search(r"\d+", cells[0])
-                                if not rank_m:
-                                    continue
-                                name = normalize_person_name(cells[1])
-                                if name:
-                                    jockeys[name] = {"rank": int(rank_m.group()), "wins": None, "rides": None, "win_rate": None, "place_rate": None, "raw_name": cells[1]}
-                    if "調教師" in header_text and not trainers:
-                        for cells in rows[1:]:
-                            if len(cells) >= 2:
-                                rank_m = re.search(r"\d+", cells[0])
-                                if not rank_m:
-                                    continue
-                                name = normalize_person_name(cells[1])
-                                if name:
-                                    trainers[name] = {"rank": int(rank_m.group()), "wins": None, "rides": None, "win_rate": None, "place_rate": None, "raw_name": cells[1]}
-
-            if jockeys or trainers:
-                used_url = url
-                # 両方取れたURLを優先
-                if jockeys and trainers:
-                    break
-        except Exception:
-            continue
-
-    if not jockeys and not trainers:
-        return {
-            "reference_year": current_year,
-            "reference_label": f"{current_year}年・取得失敗",
-            "jockeys": {},
-            "trainers": {},
-            "source_url": JRA_LEADING_URL,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
+    success = bool(jockeys or trainers)
     return {
         "reference_year": current_year,
-        "reference_label": f"{current_year}年・JRA公式 最新",
+        "reference_label": (
+            f"{current_year}年・JRA公式 最新"
+            if success else f"{current_year}年・JRA公式 取得失敗"
+        ),
         "jockeys": jockeys,
         "trainers": trainers,
-        "source_url": used_url or JRA_LEADING_URL,
+        "source_url": JRA_LEADING_URL,
+        "jockey_source_url": JRA_LEADING_JOCKEY_URL,
+        "trainer_source_url": JRA_LEADING_TRAINER_URL,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "success": success,
+        "errors": errors,
+        "matched_jockeys": sum(
+            1 for v in jockeys.values() if v.get("matched_japanese_name")
+        ),
+        "matched_trainers": sum(
+            1 for v in trainers.values() if v.get("matched_japanese_name")
+        ),
     }
 
 
@@ -1974,7 +1952,12 @@ if mode == "🏇 リアルタイム予想":
             st.write(f"参照: {leading_info.get('reference_label', '未取得')}")
             st.write(f"騎手データ: {len(leading_info.get('jockeys', {}))}名")
             st.write(f"調教師データ: {len(leading_info.get('trainers', {}))}名")
+            st.write(f"日本語名照合: 騎手 {leading_info.get('matched_jockeys', 0)}名 / 調教師 {leading_info.get('matched_trainers', 0)}名")
             st.write(f"取得元: {leading_info.get('source_url', JRA_LEADING_URL)}")
+            st.write(f"騎手ランキング: {leading_info.get('jockey_source_url', '-')}")
+            st.write(f"調教師ランキング: {leading_info.get('trainer_source_url', '-')}")
+            if leading_info.get('errors'):
+                st.warning(" / ".join(leading_info['errors']))
 
         with st.expander("🔎 脚質・オッズ取得診断"):
             diag_df = pd.DataFrame(fetched_info["horses"])
