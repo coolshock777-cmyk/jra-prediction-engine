@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.15"
+VERSION = "Ver.2.16"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -1053,6 +1053,20 @@ def fetch_netkeiba_race_data_cached(race_id: str):
         # ----------------------------------------------------
         # 脚質・オッズ補完用の過去走ページ
         # ----------------------------------------------------
+        # ここは必ずこの関数内でURL一覧を生成する。
+        # Ver.2.15では past_urls の定義が抜けていたため、
+        # 出走表取得時に NameError が発生していた。
+        past_urls = [
+            (
+                "https://race.netkeiba.com/race/"
+                f"shutuba_past.html?race_id={race_id}"
+            ),
+            (
+                "https://race.netkeiba.com/race/"
+                f"shutuba_past_9.html?race_id={race_id}"
+            ),
+        ]
+
         past_soups = []
 
         for past_url in past_urls:
