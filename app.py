@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.18"
+VERSION = "Ver.2.19"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -539,7 +539,13 @@ def extract_odds_from_row(row):
 
 
 def extract_style_from_text(text: str) -> str:
-    """netkeibaの「逃中2週」「先中3週」等から脚質を抽出する。"""
+    """
+    netkeibaの脚質表記を抽出する。
+
+    現行の出馬表では「Image先中13週」のように、
+    脚質が画面上のテキストではなく img の alt/title 等の属性に
+    入っているケースがあるため、呼び出し側で属性値も渡せるようにする。
+    """
     text = normalize_text(text)
 
     if not text:
@@ -585,6 +591,65 @@ def extract_style_from_text(text: str) -> str:
         return "追"
 
     return "不明"
+
+
+def extract_style_from_row(row) -> str:
+    """
+    現在の出馬表1行から脚質を最優先で取得する。
+
+    netkeibaのHTMLでは「Image先中2週」等が img の alt、title、
+    aria-label、data-* 属性に入る場合があるため、row.get_text()だけに
+    依存しない。
+    """
+    if row is None:
+        return "不明"
+
+    # 1) 脚質専用classを最優先
+    elem = find_first_by_class(
+        row,
+        r"Kyakushitsu|RunningStyle|Style",
+    )
+    if elem:
+        candidates = [
+            elem.get_text(" ", strip=True),
+            elem.get("alt", ""),
+            elem.get("title", ""),
+            elem.get("aria-label", ""),
+        ]
+        for value in candidates:
+            style = extract_style_from_text(value)
+            if style != "不明":
+                return style
+
+    # 2) row配下の全属性を探索。特にimg alt/titleを重視
+    for tag in row.find_all(True):
+        candidates = [
+            tag.get_text(" ", strip=True),
+            tag.get("alt", ""),
+            tag.get("title", ""),
+            tag.get("aria-label", ""),
+        ]
+
+        for attr, value in tag.attrs.items():
+            attr_name = str(attr).lower()
+            if (
+                attr_name.startswith("data-")
+                or attr_name in {"alt", "title", "aria-label", "data-original-title"}
+            ):
+                if isinstance(value, (list, tuple)):
+                    candidates.extend(str(v) for v in value)
+                else:
+                    candidates.append(str(value))
+
+        for value in candidates:
+            style = extract_style_from_text(value)
+            if style != "不明":
+                return style
+
+    # 3) 最後に行全体の表示文字列
+    return extract_style_from_text(
+        row.get_text(" ", strip=True)
+    )
 
 
 def extract_style_from_past_row(row) -> str:
@@ -1338,11 +1403,8 @@ def fetch_netkeiba_race_data_cached(race_id: str):
                     odds = extract_odds_from_row(row)
 
                 # 現在の出馬表の馬行から脚質を最優先で取得。
-                # netkeibaでは「Image先中13週」のように
-                # 馬行内へ現在脚質が直接記載される。
-                style = extract_style_from_text(
-                    row.get_text(" ", strip=True)
-                )
+                # 「Image先中13週」のようなimg属性内の脚質も対象にする。
+                style = extract_style_from_row(row)
                 style_source = (
                     "出馬表・脚質欄"
                     if style != "不明"
