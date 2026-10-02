@@ -2,6 +2,6 @@ streamlit
 pandas
 requests
 beautifulsoup4
-lxml
-gspread
-google-auth
+numpy
+pydrive2
+oauth2client
