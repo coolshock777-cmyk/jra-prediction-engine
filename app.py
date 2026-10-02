@@ -24,7 +24,7 @@ st.set_page_config(
 # 1. バージョン・マスター
 # ============================================================
 
-VERSION = "Ver.2.03"
+VERSION = "Ver.2.04"
 
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
@@ -359,7 +359,101 @@ def parse_odds(text: str):
 
 
 # ============================================================
-# 8. netkeibaデータ取得（オッズピンポイント抽出版）
+# 8. オッズ専用ページフォールバック取得
+# ============================================================
+
+def fetch_fallback_odds_dict(race_id: str) -> dict:
+
+    odds_dict = {}
+
+    url = f"https://race.netkeiba.com/odds/index.html?type=b1&race_id={race_id}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/120.0.0.0 "
+            "Safari/537.36"
+        )
+    }
+
+    try:
+
+        res = requests.get(url, headers=headers, timeout=10)
+
+        if res.status_code != 200:
+            return odds_dict
+
+        res.encoding = res.apparent_encoding or "euc-jp"
+
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # 馬番セルとオッズセルを探す
+        rows = soup.find_all("tr", id=re.compile(r"odds-td-\d+|row-\d+"))
+
+        if not rows:
+            rows = soup.find_all("tr")
+
+        for row in rows:
+
+            try:
+
+                # 馬番
+                uma_td = row.find(re.compile("td|span"), class_=re.compile("Umaban|Num"))
+
+                if not uma_td:
+                    continue
+
+                uma_txt = uma_td.get_text(strip=True)
+
+                m_uma = re.search(r"\d+", uma_txt)
+
+                if not m_uma:
+                    continue
+
+                uma_num = int(m_uma.group())
+
+                # 単勝オッズ
+                odds_td = row.find(re.compile("td|span"), id=re.compile(r"odds-1_") or class_=re.compile("Odds"))
+
+                if not odds_td:
+
+                    # Txt_Rなどの右寄せセルから検出
+                    tds = row.find_all("td")
+
+                    for td in tds:
+
+                        val = parse_odds(td.get_text(strip=True))
+
+                        if val is not None and val >= 1.0:
+
+                            odds_dict[uma_num] = val
+
+                            break
+
+                else:
+
+                    val = parse_odds(odds_td.get_text(strip=True))
+
+                    if val is not None and val >= 1.0:
+
+                        odds_dict[uma_num] = val
+
+            except Exception:
+
+                continue
+
+    except Exception:
+
+        pass
+
+    return odds_dict
+
+
+# ============================================================
+# 8. netkeibaデータ取得（二段階自動補完版）
 # ============================================================
 
 @st.cache_data(
@@ -544,7 +638,6 @@ def fetch_netkeiba_race_data_cached(
 
         kyaku_count = 0
         front_runner_count = 0
-        valid_odds_count = 0
 
         for row in horse_rows:
 
@@ -677,32 +770,18 @@ def fetch_netkeiba_race_data_cached(
 
                         front_runner_count += 1
 
-                # オッズ（netkeibaの id="odds-1_1" 構造をピンポイント取得）
+                # 出馬表側からのオッズ判定
                 odds = None
-                
-                # パターン1: id属性でoddsが含まれる要素（最も確実）
+
                 odds_elem = row.find(re.compile("td|span"), id=re.compile(r"odds-\d+_\d+"))
+
                 if odds_elem:
                     odds = parse_odds(odds_elem.get_text(strip=True))
-                
-                # パターン2: classにOddsが含まれる要素
+
                 if odds is None:
                     odds_elem = row.find(re.compile("td|span"), class_=re.compile(r"Odds"))
                     if odds_elem:
                         odds = parse_odds(odds_elem.get_text(strip=True))
-
-                # パターン3: 出走表の右側にあるオッズセル（Txt_R）から直接パース
-                if odds is None:
-                    txt_r_elems = row.find_all("td", class_=re.compile("Txt_R"))
-                    for td in txt_r_elems:
-                        val = parse_odds(td.get_text(strip=True))
-                        if val is not None:
-                            odds = val
-                            break
-
-                if odds is not None and odds >= 1.0:
-
-                    valid_odds_count += 1
 
                 if horse_name and uma > 0:
 
@@ -726,6 +805,29 @@ def fetch_netkeiba_race_data_cached(
             return None, (
                 "出走馬データの抽出件数が0件です。"
             )
+
+        # ----------------------------------------------------
+        # フォールバック: オッズ不足時は専用ページから補正
+        # ----------------------------------------------------
+
+        valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
+
+        if (valid_odds_count / len(horses)) < 0.70:
+
+            fallback_odds = fetch_fallback_odds_dict(race_id)
+
+            if fallback_odds:
+
+                for h in horses:
+
+                    uma_num = h["馬番"]
+
+                    if uma_num in fallback_odds:
+
+                        h["オッズ"] = fallback_odds[uma_num]
+
+        # 最終確認
+        valid_odds_count = sum(1 for h in horses if h.get("オッズ") is not None)
 
         odds_coverage = (
             valid_odds_count / len(horses)
@@ -1226,7 +1328,7 @@ if mode == "🏇 リアルタイム予想":
             )
 
     st.markdown(
-        "### ⚙️ モデル条件"
+        "### ⚙️️ モデル条件"
     )
 
     c1, c2, c3 = st.columns(3)
@@ -1705,7 +1807,7 @@ if mode == "🏇 リアルタイム予想":
         with r3:
 
             st.subheader(
-                "⚙️ 設定"
+                "⚙️️ 設定"
             )
 
             st.write(
