@@ -1,39 +1,33 @@
-import os
-import re
-import math
-import uuid
-from datetime import datetime, date
-
+import streamlit as st
 import pandas as pd
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
+import re
+import numpy as np
+import os
+import hashlib
+from datetime import datetime
 
 
-# =========================================================
-# 基本設定
-# =========================================================
+# ============================================================
+# 0. アプリ基本設定
+# ============================================================
+
+st.set_page_config(
+    page_title="JRA AI予想 & 成績検証エンジン",
+    page_icon="🏇",
+    layout="wide",
+)
 
 VERSION = "Ver.2.07"
+APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
-HISTORY_FILE = "JRA_Prediction_History.csv"
+JRA_VENUES = [
+    "東京", "中山", "阪神", "京都", "中京",
+    "新潟", "福島", "小倉", "札幌", "函館",
+]
 
-NETKEIBA_RACE_URL = (
-    "https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-)
-
-NETKEIBA_ODDS_URL = (
-    "https://race.netkeiba.com/odds/index.html"
-    "?race_id={race_id}&rf=shutuba_submenu&type=b1"
-)
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
-
-VENUE_CODES = {
+VENUE_CODE_MAP = {
     "札幌": "01",
     "函館": "02",
     "福島": "03",
@@ -46,2346 +40,1986 @@ VENUE_CODES = {
     "小倉": "10",
 }
 
+VENUE_NAME_MAP = {v: k for k, v in VENUE_CODE_MAP.items()}
+
 TURF_DISTANCES = [
-    "1000m",
-    "1200m",
-    "1400m",
-    "1500m",
-    "1600m",
-    "1800m",
-    "2000m",
-    "2200m",
-    "2300m",
-    "2400m",
-    "2500m",
-    "2600m",
-    "3000m",
-    "3200m",
-    "3400m",
-    "3600m",
+    "1000m", "1200m", "1400m", "1500m", "1600m",
+    "1800m", "2000m", "2200m", "2400m", "2500m",
+    "2600m", "3000m", "3200m", "3400m", "3600m",
 ]
 
 DIRT_DISTANCES = [
-    "1000m",
-    "1150m",
-    "1200m",
-    "1300m",
-    "1400m",
-    "1600m",
-    "1700m",
-    "1800m",
-    "1900m",
-    "2000m",
-    "2100m",
-    "2400m",
+    "1000m", "1150m", "1200m", "1400m", "1600m",
+    "1700m", "1800m", "2100m", "2400m", "2500m",
 ]
 
-STYLE_LABELS = {
-    "逃": "逃げ",
-    "先": "先行",
-    "差": "差し",
-    "追": "追込",
+ALL_DISTANCES = sorted(
+    list(set(TURF_DISTANCES + DIRT_DISTANCES)),
+    key=lambda x: int(x.replace("m", "")),
+)
+ALL_DISTANCES_WITH_OTHER = ALL_DISTANCES + ["その他"]
+
+CSV_FILENAME = "JRA_Prediction_History.csv"
+
+CSV_COLUMNS = [
+    "予測ログID", "レースID", "レース名", "開催日", "予想日時",
+    "データ取得日時", "コース", "距離", "馬場状態", "出走頭数",
+    "勝負度", "軸馬", "相手馬", "軸馬オッズ", "バイアス履歴",
+    "モデルバージョン", "確定フラグ", "回収額", "収支", "メモ",
+    "投資額", "オッズ状態", "オッズ取得率",
+]
+
+
+# ============================================================
+# 1. セッション状態
+# ============================================================
+
+DEFAULT_SESSION_VALUES = {
+    "authenticated": False,
+    "fetched_info": None,
+    "latest_prediction": None,
 }
 
-
-# =========================================================
-# Streamlit設定
-# =========================================================
-
-st.set_page_config(
-    page_title="JRA Prediction Engine",
-    page_icon="🏇",
-    layout="wide",
-)
+for key, value in DEFAULT_SESSION_VALUES.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-# =========================================================
-# ログイン
-# =========================================================
+# ============================================================
+# 2. ログイン
+# ============================================================
 
-def check_login():
-    app_password = st.secrets.get("APP_PASSWORD", "")
-
-    if not app_password:
+def check_password():
+    if st.session_state["authenticated"]:
         return True
 
-    if st.session_state.get("logged_in", False):
-        return True
+    st.title("🔒 ログイン")
 
-    st.title("🏇 JRA Prediction Engine")
-    st.caption(VERSION)
-
-    password = st.text_input(
-        "パスワード",
+    password_input = st.text_input(
+        "パスワードを入力してください",
         type="password",
-        key="login_password",
     )
 
-    if st.button("ログイン", type="primary"):
-        if password == app_password:
-            st.session_state["logged_in"] = True
+    if st.button("ログイン", use_container_width=True):
+        try:
+            app_password = st.secrets.get("APP_PASSWORD", "")
+        except Exception:
+            app_password = ""
+
+        if app_password and password_input == app_password:
+            st.session_state["authenticated"] = True
             st.rerun()
         else:
-            st.error("パスワードが違います。")
+            st.error("パスワードが正しくありません。")
 
     return False
 
 
-if not check_login():
+if not check_password():
     st.stop()
 
 
-# =========================================================
-# HTTP共通処理
-# =========================================================
+# ============================================================
+# 3. CSV管理
+# ============================================================
 
-def make_headers():
-    return {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-        "Referer": "https://race.netkeiba.com/",
-        "Connection": "keep-alive",
-    }
+def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
+    numeric_cols = [
+        "出走頭数", "軸馬オッズ", "回収額",
+        "収支", "投資額", "オッズ取得率",
+    ]
 
-def decode_response(response):
-    """
-    netkeibaページの文字コードをなるべく安全に決定。
-    """
-    content_type = response.headers.get("Content-Type", "").lower()
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            ).fillna(0)
 
-    if "charset=utf-8" in content_type:
-        response.encoding = "utf-8"
-    elif "euc-jp" in content_type:
-        response.encoding = "euc-jp"
-    else:
-        # 現在のnetkeibaはUTF-8系ページも多いため、
-        # apparent_encodingだけに依存しない。
-        apparent = response.apparent_encoding
-
-        if apparent:
-            response.encoding = apparent
-        else:
-            response.encoding = "utf-8"
-
-    return response.text
+    return df
 
 
-# =========================================================
-# 文字列・数値ユーティリティ
-# =========================================================
+def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-def normalize_text(text):
-    if text is None:
+    for col in CSV_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[CSV_COLUMNS]
+    return sanitize_df_types(df)
+
+
+def load_history_df():
+    if os.path.exists(CSV_FILENAME):
+        try:
+            df = pd.read_csv(
+                CSV_FILENAME,
+                encoding="utf-8-sig",
+            )
+            df = normalize_history_columns(df)
+            st.session_state["history_df"] = df
+            return df
+        except Exception as e:
+            st.warning(
+                f"履歴CSVの読み込みに失敗しました。"
+                f"新しい履歴として扱います: {e}"
+            )
+
+    if "history_df" not in st.session_state:
+        st.session_state["history_df"] = pd.DataFrame(
+            columns=CSV_COLUMNS
+        )
+
+    return st.session_state["history_df"]
+
+
+def save_history_df(df: pd.DataFrame):
+    df = normalize_history_columns(df)
+    st.session_state["history_df"] = df
+
+    try:
+        df.to_csv(
+            CSV_FILENAME,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        return True
+    except Exception as e:
+        st.error(f"ファイル保存エラー: {str(e)}")
+        return False
+
+
+load_history_df()
+
+
+# ============================================================
+# 4. レースID
+# ============================================================
+
+def generate_jra_race_id(
+    year: int,
+    venue_name: str,
+    kai: int,
+    nichi: int,
+    race_num: int,
+) -> str:
+    venue_code = VENUE_CODE_MAP.get(venue_name, "05")
+
+    return (
+        f"{year}"
+        f"{venue_code}"
+        f"{kai:02d}"
+        f"{nichi:02d}"
+        f"{race_num:02d}"
+    )
+
+
+def extract_race_id(value: str):
+    if not value:
+        return None
+
+    match = re.search(r"(\d{12})", str(value))
+
+    if not match:
+        return None
+
+    return match.group(1)
+
+
+# ============================================================
+# 5. 解析ヘルパー
+# ============================================================
+
+def normalize_text(value) -> str:
+    if value is None:
         return ""
 
-    text = str(text)
-    text = text.replace("\xa0", " ")
-    text = text.replace("\u3000", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value).replace("\xa0", " "),
+    ).strip()
 
 
-def normalize_horse_name(text):
-    text = normalize_text(text)
-
-    # netkeiba上の余計な記号を軽く除去
-    text = text.replace("★", "")
-    text = text.replace("△", "")
-    text = text.replace("▲", "")
-    text = text.replace("○", "")
-    text = text.replace("◎", "")
-
-    return text.strip()
-
-
-def parse_int(text):
-    if text is None:
-        return None
-
-    text = normalize_text(text)
-    match = re.search(r"\d+", text)
-
-    if not match:
-        return None
-
-    try:
-        return int(match.group(0))
-    except Exception:
-        return None
-
-
-def parse_float(text):
-    if text is None:
-        return None
-
-    text = normalize_text(text)
-    match = re.search(r"\d+(?:\.\d+)?", text)
-
-    if not match:
-        return None
-
-    try:
-        return float(match.group(0))
-    except Exception:
-        return None
-
-
-# =========================================================
-# オッズ解析
-# =========================================================
-
-def parse_odds(text):
-    """
-    単勝オッズ専用。
-    例:
-      1.8 -> 1.8
-      10.2 -> 10.2
-      123.4 -> 123.4
-      ---.- -> None
-      取消 -> None
-      除外 -> None
-    """
-
-    if text is None:
-        return None
-
+def parse_distance_from_text(text: str) -> str:
     text = normalize_text(text)
 
     if not text:
-        return None
+        return "その他"
 
-    invalid_values = {
-        "---.-",
-        "---",
-        "--.-",
-        "-",
-        "取消",
-        "除外",
-        "発走除外",
-        "取止",
-        "中止",
-        "出走取消",
-    }
-
-    if text in invalid_values:
-        return None
-
-    # オッズページの通常表記
     match = re.search(
-        r"(?<!\d)(\d{1,4}(?:\.\d+)?)(?!\d)",
+        r"(\d{3,4})\s*m",
         text,
+        flags=re.IGNORECASE,
     )
 
-    if not match:
+    if match:
+        dist = f"{match.group(1)}m"
+        if dist in ALL_DISTANCES:
+            return dist
+
+    match = re.search(r"(\d{3,4})", text)
+
+    if match:
+        dist = f"{match.group(1)}m"
+        if dist in ALL_DISTANCES:
+            return dist
+
+    return "その他"
+
+
+def parse_odds(text):
+    if text is None:
         return None
 
-    try:
-        value = float(match.group(1))
-    except Exception:
+    text = normalize_text(text)
+
+    if not text or text in {"---.-", "---", "-", "None", "nan"}:
         return None
 
-    if value < 1.0:
-        return None
+    # オッズとして成立する小数を優先
+    candidates = re.findall(r"\d+(?:\.\d+)?", text)
 
-    return value
-
-
-# =========================================================
-# 脚質解析
-# =========================================================
-
-def extract_running_style(row):
-    """
-    netkeiba側のHTML変更に備えて複数候補から脚質を取得する。
-
-    重要:
-    脚質がHTML上に存在しない場合は推測しない。
-    その場合は「不明」を返す。
-    """
-
-    # -----------------------------------------------------
-    # 1. class名から探す
-    # -----------------------------------------------------
-
-    class_pattern = re.compile(
-        r"Kyakushitsu|Kyakusitsu|Style|RunningStyle|Running",
-        re.IGNORECASE,
-    )
-
-    candidates = row.find_all(
-        ["td", "th", "span", "div", "p"],
-        class_=class_pattern,
-    )
-
-    for elem in candidates:
-        text = normalize_text(elem.get_text(" ", strip=True))
-
-        if not text:
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except Exception:
             continue
 
-        # 逃げ / 先行 / 差し / 追込
-        for key, label in STYLE_LABELS.items():
-            if key in text:
-                return label
+        if 1.0 <= value <= 9999.0:
+            return value
 
-        # 「逃」「先」など単独表示
-        if text in STYLE_LABELS:
-            return STYLE_LABELS[text]
+    return None
 
-    # -----------------------------------------------------
-    # 2. data-* 属性から探す
-    # -----------------------------------------------------
 
-    for elem in row.find_all(True):
-        attrs = elem.attrs
+def extract_class_text(element) -> str:
+    if element is None:
+        return ""
 
-        for attr_name, attr_value in attrs.items():
-            attr_name_lower = str(attr_name).lower()
+    return " ".join(
+        element.get("class", [])
+    )
 
-            if (
-                "style" in attr_name_lower
-                or "kyaku" in attr_name_lower
-                or "脚質" in attr_name_lower
-            ):
-                if isinstance(attr_value, list):
-                    value = " ".join(map(str, attr_value))
-                else:
-                    value = str(attr_value)
 
-                value = normalize_text(value)
+def find_first_by_class(row, pattern):
+    return row.find(
+        lambda tag: (
+            hasattr(tag, "get")
+            and re.search(
+                pattern,
+                " ".join(tag.get("class", [])),
+                flags=re.I,
+            )
+        )
+    )
 
-                for key, label in STYLE_LABELS.items():
-                    if key in value:
-                        return label
 
-    # -----------------------------------------------------
-    # 3. 「脚質：逃げ」のような表示を探す
-    # -----------------------------------------------------
+def extract_number_by_class(row, pattern):
+    elem = find_first_by_class(row, pattern)
 
-    row_text = normalize_text(row.get_text(" ", strip=True))
+    if elem:
+        match = re.search(
+            r"\d+",
+            normalize_text(elem.get_text(" ", strip=True)),
+        )
+        if match:
+            return int(match.group())
+
+    return 0
+
+
+def extract_horse_name(row) -> str:
+    selectors = [
+        "span.HorseName",
+        ".HorseName",
+        "span[class*='HorseName']",
+    ]
+
+    for selector in selectors:
+        elem = row.select_one(selector)
+
+        if elem:
+            text = normalize_text(
+                elem.get_text(" ", strip=True)
+            )
+            if text:
+                return text
+
+    # 最後のフォールバック。
+    # 父名等を拾わないよう、horse DBリンクのうち
+    # 「馬名表示に近い要素」を優先する。
+    links = row.select("a[href*='/horse/']")
+
+    for link in links:
+        text = normalize_text(link.get_text(" ", strip=True))
+        if text:
+            parent_text = normalize_text(
+                link.parent.get_text(" ", strip=True)
+            )
+            if text in parent_text:
+                return text
+
+    return ""
+
+
+def extract_jockey(row) -> str:
+    elem = find_first_by_class(
+        row,
+        r"Jockey|JockeyName",
+    )
+
+    if elem:
+        text = normalize_text(
+            elem.get_text(" ", strip=True)
+        )
+        if text:
+            return text
+
+    # 騎手DBリンクをフォールバックにする
+    for link in row.select("a[href*='/jockey/']"):
+        text = normalize_text(link.get_text(" ", strip=True))
+        if text:
+            return text
+
+    return ""
+
+
+def extract_kinryo(row):
+    # 斤量は通常 52.0 / 55.0 / 56.0 のような値。
+    # 年齢等の別数字を拾わないよう、40～70kg相当だけ採用。
+    for td in row.find_all("td"):
+        txt = normalize_text(td.get_text(" ", strip=True))
+        match = re.fullmatch(r"(\d{2}(?:\.\d)?)", txt)
+
+        if match:
+            value = float(match.group(1))
+
+            if 40.0 <= value <= 70.0:
+                return value
+
+    return None
+
+
+def extract_odds_from_row(row):
+    # まずクラス名に Odds が含まれる要素を探す
+    candidates = []
+
+    for tag in row.find_all(True):
+        class_text = " ".join(
+            tag.get("class", [])
+        )
+
+        if re.search(r"Odds|OddsTxt|Odds_Ninki", class_text, re.I):
+            candidates.append(
+                normalize_text(
+                    tag.get_text(" ", strip=True)
+                )
+            )
+
+    for text in candidates:
+        odds = parse_odds(text)
+        if odds is not None:
+            return odds
+
+    # data-* 属性に odds が入っているケース
+    for tag in row.find_all(True):
+        for attr, value in tag.attrs.items():
+            if "odds" not in str(attr).lower():
+                continue
+
+            odds = parse_odds(value)
+
+            if odds is not None:
+                return odds
+
+    return None
+
+
+def extract_style_from_past_row(row) -> str:
+    # 現行のnetkeiba出馬表(過去走表示)では、
+    # 「追中11週」「差中9週」「先中3週」のように
+    # 脚質が行内に含まれる。
+    elem = find_first_by_class(
+        row,
+        r"Kyakushitsu|RunningStyle|Style",
+    )
+
+    if elem:
+        txt = normalize_text(
+            elem.get_text(" ", strip=True)
+        )
+
+        for style in ["逃", "先", "差", "追"]:
+            if style in txt:
+                return style
+
+    row_text = normalize_text(
+        row.get_text(" ", strip=True)
+    )
 
     match = re.search(
-        r"脚質\s*[:：]?\s*(逃げ|先行|差し|追込|逃|先|差|追)",
+        r"(逃|先|差|追)(?=中\d+週|中\d+ヶ月|初出走)",
         row_text,
     )
 
     if match:
-        value = match.group(1)
+        return match.group(1)
 
-        if value in STYLE_LABELS:
-            return STYLE_LABELS[value]
-
-        return value
-
-    return "不明"
-
-
-# =========================================================
-# 枠番・馬番解析
-# =========================================================
-
-def extract_horse_number(row):
-    """
-    出馬表のHorseListから馬番を取得。
-    """
-
-    # class名から探す
-    class_pattern = re.compile(
-        r"Umaban|HorseNum|HorseNo|Num",
-        re.IGNORECASE,
-    )
-
-    elems = row.find_all(
-        ["td", "th", "span", "div"],
-        class_=class_pattern,
-    )
-
-    for elem in elems:
-        text = normalize_text(elem.get_text(" ", strip=True))
-
-        if re.fullmatch(r"\d{1,2}", text):
-            number = int(text)
-
-            if 1 <= number <= 18:
-                return number
-
-    # 一般的な出馬表では馬番が2番目のセルにあることが多い
-    cells = row.find_all(["td", "th"])
-
-    texts = [
-        normalize_text(cell.get_text(" ", strip=True))
-        for cell in cells
-    ]
-
-    if len(texts) >= 2:
-        candidate = texts[1]
-
-        if re.fullmatch(r"\d{1,2}", candidate):
-            number = int(candidate)
-
-            if 1 <= number <= 18:
-                return number
-
-    # 最後の保険
-    for text in texts:
-        if re.fullmatch(r"\d{1,2}", text):
-            number = int(text)
-
-            if 1 <= number <= 18:
-                return number
-
-    return None
-
-
-def extract_frame_number(row):
-    """
-    枠番を取得。
-    """
-
-    class_pattern = re.compile(
-        r"Waku|Frame",
-        re.IGNORECASE,
-    )
-
-    elems = row.find_all(
-        ["td", "th", "span", "div"],
-        class_=class_pattern,
-    )
-
-    for elem in elems:
-        text = normalize_text(elem.get_text(" ", strip=True))
-
-        if re.fullmatch(r"\d", text):
-            value = int(text)
-
-            if 1 <= value <= 8:
-                return value
-
-    # 枠番画像のalt等
-    for elem in row.find_all(True):
-        for attr_name in ["alt", "title", "data-waku"]:
-            value = elem.get(attr_name)
-
-            if value:
-                text = normalize_text(value)
-
-                match = re.search(r"(\d)", text)
-
-                if match:
-                    frame = int(match.group(1))
-
-                    if 1 <= frame <= 8:
-                        return frame
-
-    # 最初のセル
-    cells = row.find_all(["td", "th"])
-
-    if cells:
-        text = normalize_text(cells[0].get_text(" ", strip=True))
-
-        if re.fullmatch(r"\d", text):
-            value = int(text)
-
-            if 1 <= value <= 8:
-                return value
-
-    return None
-
-
-# =========================================================
-# 騎手・馬名・斤量解析
-# =========================================================
-
-def extract_horse_name(row):
-    """
-    馬名を複数候補から取得。
-    """
-
-    candidates = row.find_all(
-        ["a", "span", "div"],
-        class_=re.compile(
-            r"Bamei|HorseName|Horse|UmaName",
-            re.IGNORECASE,
-        ),
-    )
-
-    for elem in candidates:
-        text = normalize_horse_name(
-            elem.get_text(" ", strip=True)
-        )
-
-        if text and len(text) >= 2:
-            return text
-
-    # horse_idリンク周辺
-    for link in row.find_all("a", href=True):
-        href = link.get("href", "")
-
-        if "/horse/" in href:
-            text = normalize_horse_name(
-                link.get_text(" ", strip=True)
-            )
-
-            if text:
-                return text
-
-    # 最後の保険
-    cells = row.find_all("td")
-
-    for cell in cells:
-        text = normalize_horse_name(
-            cell.get_text(" ", strip=True)
-        )
-
-        if (
-            text
-            and len(text) >= 2
-            and not re.fullmatch(r"\d+", text)
-            and "kg" not in text.lower()
-        ):
-            # 騎手名らしいセルは除外しやすくする
-            if "騎手" not in text:
-                return text
+    # 「逃げ」「先行」「差し」「追込」表記にも対応
+    if "逃げ" in row_text:
+        return "逃"
+    if "先行" in row_text:
+        return "先"
+    if "差し" in row_text:
+        return "差"
+    if "追込" in row_text:
+        return "追"
 
     return "不明"
 
 
-def extract_jockey(row):
-    candidates = row.find_all(
-        ["a", "span", "div"],
-        class_=re.compile(
-            r"Jockey|JockeyName|Kisyu",
-            re.IGNORECASE,
-        ),
-    )
-
-    for elem in candidates:
-        text = normalize_text(
-            elem.get_text(" ", strip=True)
-        )
-
-        if text:
-            return text
-
-    # /jockey/ リンク
-    for link in row.find_all("a", href=True):
-        href = link.get("href", "")
-
-        if "/jockey/" in href:
-            text = normalize_text(
-                link.get_text(" ", strip=True)
-            )
-
-            if text:
-                return text
-
-    return "不明"
-
-
-def extract_weight(row):
-    """
-    斤量。
-    例: 56.0 / 56
-    """
-
-    candidates = row.find_all(
-        ["td", "span", "div"],
-        class_=re.compile(
-            r"Weight|Futan|Futankin|Bataiju",
-            re.IGNORECASE,
-        ),
-    )
-
-    for elem in candidates:
-        value = parse_float(
-            elem.get_text(" ", strip=True)
-        )
-
-        if value is not None and 40 <= value <= 70:
-            return value
-
-    # セル全体から 40～70kg を探す
-    for cell in row.find_all("td"):
-        text = normalize_text(
-            cell.get_text(" ", strip=True)
-        )
-
-        match = re.search(
-            r"(?<!\d)(4\d(?:\.\d)?|5\d(?:\.\d)?|6\d(?:\.\d)?|70(?:\.0)?)(?:kg)?",
-            text,
-        )
-
-        if match:
-            try:
-                value = float(match.group(1))
-
-                if 40 <= value <= 70:
-                    return value
-            except Exception:
-                pass
-
-    return None
-
-
-# =========================================================
-# 出馬表取得
-# =========================================================
-
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_race_card(race_id):
-    url = NETKEIBA_RACE_URL.format(race_id=race_id)
-
-    response = requests.get(
-        url,
-        headers=make_headers(),
-        timeout=20,
-    )
-
-    response.raise_for_status()
-
-    html = decode_response(response)
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # -----------------------------------------------------
-    # レース情報
-    # -----------------------------------------------------
-
-    race_name = "不明"
-
-    title = soup.find("h1")
-
-    if title:
-        race_name = normalize_text(
-            title.get_text(" ", strip=True)
-        )
-
-    race_info_text = ""
-
-    race_data = soup.find(
-        "div",
-        class_=re.compile(r"RaceData01"),
-    )
-
-    if race_data:
-        race_info_text = normalize_text(
-            race_data.get_text(" ", strip=True)
-        )
-
-    # 日付
-    race_date = None
-
-    date_match = re.search(
-        r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
-        soup.get_text(" ", strip=True),
-    )
-
-    if date_match:
-        try:
-            race_date = date(
-                int(date_match.group(1)),
-                int(date_match.group(2)),
-                int(date_match.group(3)),
-            )
-        except Exception:
-            race_date = None
-
-    # -----------------------------------------------------
-    # 場所
-    # -----------------------------------------------------
-
-    venue = "不明"
-
-    for venue_name in VENUE_CODES:
-        if venue_name in race_info_text:
-            venue = venue_name
-            break
-
-    if venue == "不明":
-        for venue_name in VENUE_CODES:
-            if venue_name in soup.get_text(" ", strip=True):
-                venue = venue_name
-                break
-
-    # -----------------------------------------------------
-    # 距離・芝ダ
-    # -----------------------------------------------------
-
-    track_type = "不明"
-    distance = None
-    condition = "不明"
-
-    track_match = re.search(
-        r"(芝|ダート|ダ)\s*(\d{3,4})m",
-        race_info_text,
-    )
-
-    if track_match:
-        raw_track = track_match.group(1)
-        distance = int(track_match.group(2))
-
-        if raw_track == "芝":
-            track_type = "芝"
-        else:
-            track_type = "ダート"
-
-    # HTML全体からの保険
-    if distance is None:
-        all_text = soup.get_text(" ", strip=True)
-
-        match = re.search(
-            r"(芝|ダート|ダ)\s*(\d{3,4})m",
-            all_text,
-        )
-
-        if match:
-            distance = int(match.group(2))
-
-            if match.group(1) == "芝":
-                track_type = "芝"
-            else:
-                track_type = "ダート"
-
-    # 馬場状態
-    for cond in ["良", "稍重", "重", "不良"]:
-        if f"馬場:{cond}" in race_info_text:
-            condition = cond
-            break
-
-        if f"馬場：{cond}" in race_info_text:
-            condition = cond
-            break
-
-    # -----------------------------------------------------
-    # 出走馬
-    # -----------------------------------------------------
-
-    horse_rows = soup.find_all(
+def extract_style_from_past_page(
+    soup,
+    horse_number: int,
+    horse_name: str,
+) -> str:
+    rows = soup.find_all(
         "tr",
-        class_=re.compile(r"HorseList"),
+        class_="HorseList",
     )
 
-    horses = []
-
-    for row in horse_rows:
-        horse_number = extract_horse_number(row)
-
-        if horse_number is None:
-            continue
-
-        frame_number = extract_frame_number(row)
-
-        horse_name = extract_horse_name(row)
-
-        jockey = extract_jockey(row)
-
-        weight = extract_weight(row)
-
-        running_style = extract_running_style(row)
-
-        horses.append(
-            {
-                "枠": frame_number,
-                "馬番": horse_number,
-                "馬名": horse_name,
-                "騎手": jockey,
-                "斤量": weight,
-                "脚質": running_style,
-                "オッズ": None,
-            }
-        )
-
-    if not horses:
-        raise RuntimeError(
-            "出走馬を取得できませんでした。"
-            "netkeiba側のHTML構造変更またはアクセス制限の可能性があります。"
-        )
-
-    # 馬番順
-    horses = sorted(
-        horses,
-        key=lambda x: x["馬番"],
-    )
-
-    return {
-        "race_id": race_id,
-        "race_name": race_name,
-        "race_date": race_date,
-        "venue": venue,
-        "track_type": track_type,
-        "distance": distance,
-        "condition": condition,
-        "race_info_text": race_info_text,
-        "horses": horses,
-    }
-
-
-# =========================================================
-# オッズページ解析
-# =========================================================
-
-def extract_odds_from_table(table):
-    """
-    単勝表から
-        馬番 -> オッズ
-    の辞書を作る。
-
-    netkeibaの単勝表は
-        枠 / 馬番 / 印 / 選択 / 馬名 / オッズ
-    の構造になっているため、
-    馬番と最後の数値セルを中心に解析する。
-    """
-
-    odds_map = {}
-
-    rows = table.find_all("tr")
+    best_row = None
 
     for row in rows:
-        cells = row.find_all(["td", "th"])
-
-        if len(cells) < 3:
-            continue
-
-        cell_texts = [
-            normalize_text(
-                cell.get_text(" ", strip=True)
-            )
-            for cell in cells
-        ]
-
-        # -------------------------------------------------
-        # 馬番
-        # -------------------------------------------------
-
-        horse_number = None
-
-        # classから探す
-        for cell in cells:
-            class_text = " ".join(
-                cell.get("class", [])
-            )
-
-            if re.search(
-                r"Umaban|HorseNum|HorseNo|Num",
-                class_text,
-                re.IGNORECASE,
-            ):
-                text = normalize_text(
-                    cell.get_text(" ", strip=True)
-                )
-
-                if re.fullmatch(r"\d{1,2}", text):
-                    value = int(text)
-
-                    if 1 <= value <= 18:
-                        horse_number = value
-                        break
-
-        # 通常構造: 2番目セルが馬番
-        if horse_number is None and len(cell_texts) >= 2:
-            candidate = cell_texts[1]
-
-            if re.fullmatch(r"\d{1,2}", candidate):
-                value = int(candidate)
-
-                if 1 <= value <= 18:
-                    horse_number = value
-
-        if horse_number is None:
-            continue
-
-        # -------------------------------------------------
-        # オッズ
-        # -------------------------------------------------
-
-        odds = None
-
-        # Oddsクラスを優先
-        for cell in reversed(cells):
-            class_text = " ".join(
-                cell.get("class", [])
-            )
-
-            if re.search(
-                r"Odds|OddsValue",
-                class_text,
-                re.IGNORECASE,
-            ):
-                odds = parse_odds(
-                    cell.get_text(" ", strip=True)
-                )
-
-                if odds is not None:
-                    break
-
-        # 最後のセルから探す
-        if odds is None:
-            for text in reversed(cell_texts):
-                value = parse_odds(text)
-
-                if value is not None:
-                    odds = value
-                    break
-
-        odds_map[horse_number] = odds
-
-    return odds_map
-
-
-def parse_odds_page(html):
-    soup = BeautifulSoup(html, "html.parser")
-
-    odds_map = {}
-
-    # -----------------------------------------------------
-    # 「単勝」表を優先
-    # -----------------------------------------------------
-
-    tables = soup.find_all("table")
-
-    target_tables = []
-
-    for table in tables:
-        text = normalize_text(
-            table.get_text(" ", strip=True)
+        num = extract_number_by_class(
+            row,
+            r"Umaban",
         )
 
-        if (
-            "単勝" in text
-            and "馬番" in text
-            and "オッズ" in text
-        ):
-            target_tables.append(table)
-
-    # 単勝表が取れない場合、馬番・オッズ表を探す
-    if not target_tables:
-        for table in tables:
-            text = normalize_text(
-                table.get_text(" ", strip=True)
-            )
-
-            if "馬番" in text and "オッズ" in text:
-                target_tables.append(table)
-
-    for table in target_tables:
-        parsed = extract_odds_from_table(table)
-
-        for horse_number, odds in parsed.items():
-            odds_map[horse_number] = odds
-
-        # 18頭分以上取れたら十分
-        if len(odds_map) >= 18:
+        if num == horse_number:
+            best_row = row
             break
 
-    return odds_map
+    if best_row is None and horse_name:
+        for row in rows:
+            name = extract_horse_name(row)
+            if name == horse_name:
+                best_row = row
+                break
+
+    if best_row is None:
+        return "不明"
+
+    return extract_style_from_past_row(best_row)
 
 
-# =========================================================
-# オッズ取得
-# =========================================================
+def extract_odds_from_past_page(
+    soup,
+    horse_number: int,
+    horse_name: str,
+):
+    rows = soup.find_all(
+        "tr",
+        class_="HorseList",
+    )
 
-@st.cache_data(ttl=10, show_spinner=False)
-def fetch_race_odds(race_id):
-    url = NETKEIBA_ODDS_URL.format(
-        race_id=race_id
+    best_row = None
+
+    for row in rows:
+        num = extract_number_by_class(
+            row,
+            r"Umaban",
+        )
+
+        if num == horse_number:
+            best_row = row
+            break
+
+    if best_row is None and horse_name:
+        for row in rows:
+            if extract_horse_name(row) == horse_name:
+                best_row = row
+                break
+
+    if best_row is None:
+        return None
+
+    return extract_odds_from_row(best_row)
+
+
+# ============================================================
+# 6. netkeiba取得
+# ============================================================
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/120.0.0.0 "
+        "Safari/537.36"
+    ),
+    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+}
+
+
+@st.cache_data(
+    ttl=30,
+    show_spinner=False,
+)
+def fetch_netkeiba_race_data_cached(race_id: str):
+    url = (
+        "https://race.netkeiba.com/race/"
+        f"shutuba.html?race_id={race_id}"
+    )
+
+    past_url = (
+        "https://race.netkeiba.com/race/"
+        f"shutuba_past_9.html?race_id={race_id}"
     )
 
     try:
         response = requests.get(
             url,
-            headers=make_headers(),
+            headers=REQUEST_HEADERS,
             timeout=20,
         )
 
         response.raise_for_status()
 
-        html = decode_response(response)
+        response.encoding = (
+            response.apparent_encoding
+            or response.encoding
+            or "euc-jp"
+        )
 
-        odds_map = parse_odds_page(html)
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
 
-        return {
-            "success": True,
-            "url": url,
-            "odds_map": odds_map,
-            "error": None,
+        race_data_01 = soup.find(
+            "div",
+            class_="RaceData01",
+        )
+
+        if race_data_01 is None:
+            return None, (
+                f"レース(ID:{race_id})が取得できませんでした。"
+                "レースID、開催日、開催回、日目をご確認ください。"
+            )
+
+        race_id = str(race_id)
+        venue_code = race_id[4:6]
+
+        detected_venue = VENUE_NAME_MAP.get(
+            venue_code,
+            "不明",
+        )
+
+        try:
+            race_num = int(race_id[-2:])
+        except Exception:
+            race_num = 0
+
+        extracted = {
+            "race_id": race_id,
+            "venue": detected_venue,
+            "race_num": race_num,
+            "track_type": "芝",
+            "distance": "その他",
+            "condition": "良",
+            "race_name": f"レース_{race_id}",
+            "race_date": datetime.now(),
+            "horses": [],
+            "kyaku_count": 0,
+            "front_runner_count": 0,
+            "odds_coverage": 0.0,
+            "odds_status": "未取得（発売前等）",
+            "fetched_at": datetime.now(),
         }
+
+        # ----------------------------------------------------
+        # レース日
+        # ----------------------------------------------------
+        race_data_02 = soup.find(
+            "div",
+            class_="RaceData02",
+        )
+
+        if race_data_02:
+            date_text = normalize_text(
+                race_data_02.get_text(" ", strip=True)
+            )
+
+            date_match = re.search(
+                r"(\d{4})年(\d{1,2})月(\d{1,2})日",
+                date_text,
+            )
+
+            if date_match:
+                y, m, d = map(
+                    int,
+                    date_match.groups(),
+                )
+                extracted["race_date"] = datetime(y, m, d)
+
+        # ----------------------------------------------------
+        # レース名
+        # ----------------------------------------------------
+        race_title = soup.find(
+            "div",
+            class_="RaceName",
+        )
+
+        if race_title:
+            name = normalize_text(
+                race_title.get_text(" ", strip=True)
+            )
+            if name:
+                extracted["race_name"] = name
+
+        # ----------------------------------------------------
+        # コース・距離・馬場
+        # ----------------------------------------------------
+        race_text = normalize_text(
+            race_data_01.get_text(" ", strip=True)
+        )
+
+        if "ダ" in race_text:
+            extracted["track_type"] = "ダート"
+        elif "障" in race_text:
+            extracted["track_type"] = "障害"
+        else:
+            extracted["track_type"] = "芝"
+
+        parsed_distance = parse_distance_from_text(race_text)
+
+        if parsed_distance != "その他":
+            extracted["distance"] = parsed_distance
+
+        if "不良" in race_text:
+            extracted["condition"] = "不良"
+        elif "稍重" in race_text:
+            extracted["condition"] = "稍重"
+        elif "重" in race_text:
+            extracted["condition"] = "重"
+        else:
+            extracted["condition"] = "良"
+
+        # ----------------------------------------------------
+        # 脚質・オッズ補完用の過去走ページ
+        # ----------------------------------------------------
+        past_soup = None
+
+        try:
+            past_response = requests.get(
+                past_url,
+                headers=REQUEST_HEADERS,
+                timeout=20,
+            )
+            past_response.raise_for_status()
+            past_response.encoding = (
+                past_response.apparent_encoding
+                or past_response.encoding
+                or "euc-jp"
+            )
+            past_soup = BeautifulSoup(
+                past_response.text,
+                "html.parser",
+            )
+        except Exception:
+            past_soup = None
+
+        # ----------------------------------------------------
+        # 出走馬
+        # ----------------------------------------------------
+        horse_rows = soup.find_all(
+            "tr",
+            class_="HorseList",
+        )
+
+        if not horse_rows:
+            return None, (
+                "出走馬テーブルが見つかりませんでした。"
+            )
+
+        # 同じ馬番の重複行が出るケースがあるため、
+        # 馬番をキーに統合する。
+        horse_map = {}
+
+        for row in horse_rows:
+            try:
+                waku = extract_number_by_class(
+                    row,
+                    r"Waku",
+                )
+
+                uma = extract_number_by_class(
+                    row,
+                    r"Umaban",
+                )
+
+                if uma <= 0:
+                    continue
+
+                horse_name = extract_horse_name(row)
+
+                if not horse_name:
+                    continue
+
+                jockey = extract_jockey(row)
+                kinryo = extract_kinryo(row)
+                odds = extract_odds_from_row(row)
+
+                # 脚質は通常の出馬表で取れない場合があるため、
+                # 過去走表示ページから補完する。
+                style = "不明"
+
+                if past_soup is not None:
+                    style = extract_style_from_past_page(
+                        past_soup,
+                        uma,
+                        horse_name,
+                    )
+
+                # オッズも過去走ページをフォールバックにする。
+                if odds is None and past_soup is not None:
+                    odds = extract_odds_from_past_page(
+                        past_soup,
+                        uma,
+                        horse_name,
+                    )
+
+                candidate = {
+                    "枠番": int(waku),
+                    "馬番": int(uma),
+                    "馬名": horse_name,
+                    "騎手": jockey,
+                    "斤量": kinryo,
+                    "脚質": style,
+                    "オッズ": odds,
+                }
+
+                # 重複した馬番があった場合、
+                # 情報量の多い行を優先する。
+                quality = 0
+
+                if candidate["騎手"]:
+                    quality += 3
+                if candidate["斤量"] is not None:
+                    quality += 2
+                if candidate["脚質"] != "不明":
+                    quality += 2
+                if candidate["オッズ"] is not None:
+                    quality += 2
+                if candidate["枠番"] > 0:
+                    quality += 1
+
+                old = horse_map.get(uma)
+
+                if old is None or quality > old["_quality"]:
+                    candidate["_quality"] = quality
+                    horse_map[uma] = candidate
+
+            except Exception:
+                continue
+
+        horses = []
+
+        for uma in sorted(horse_map.keys()):
+            item = horse_map[uma].copy()
+            item.pop("_quality", None)
+
+            # Noneを内部データとして許容するが、
+            # 画面表示時には必ず「-」にする。
+            horses.append(item)
+
+        if not horses:
+            return None, (
+                "出走馬データの抽出件数が0件です。"
+            )
+
+        # ----------------------------------------------------
+        # 脚質統計
+        # ----------------------------------------------------
+        kyaku_count = sum(
+            1
+            for h in horses
+            if h.get("脚質") in {"逃", "先", "差", "追"}
+        )
+
+        front_runner_count = sum(
+            1
+            for h in horses
+            if h.get("脚質") in {"逃", "先"}
+        )
+
+        # ----------------------------------------------------
+        # オッズ統計
+        # ----------------------------------------------------
+        valid_odds_count = sum(
+            1
+            for h in horses
+            if h.get("オッズ") is not None
+        )
+
+        odds_coverage = (
+            valid_odds_count / len(horses)
+            if horses
+            else 0.0
+        )
+
+        if odds_coverage >= 0.99:
+            odds_status = "当日確定"
+        elif odds_coverage >= 0.70:
+            odds_status = "当日一部取得"
+        elif odds_coverage > 0:
+            odds_status = "一部取得"
+        else:
+            odds_status = "未取得（発売前等）"
+
+        extracted["horses"] = horses
+        extracted["kyaku_count"] = kyaku_count
+        extracted["front_runner_count"] = front_runner_count
+        extracted["odds_coverage"] = odds_coverage
+        extracted["odds_status"] = odds_status
+
+        return extracted, None
+
+    except requests.exceptions.RequestException as e:
+        return None, f"通信エラー: {str(e)}"
 
     except Exception as e:
-        return {
-            "success": False,
-            "url": url,
-            "odds_map": {},
-            "error": str(e),
-        }
+        return None, f"解析エラー: {str(e)}"
 
 
-# =========================================================
-# 出馬表 + オッズ統合
-# =========================================================
+def fetch_netkeiba_race_data(race_id_or_url):
+    race_id = extract_race_id(race_id_or_url)
 
-def merge_race_data(race_data, odds_data):
-    horses = race_data["horses"]
-
-    odds_map = odds_data.get(
-        "odds_map",
-        {},
-    )
-
-    merged = []
-
-    for horse in horses:
-        horse_copy = dict(horse)
-
-        horse_number = horse_copy["馬番"]
-
-        horse_copy["オッズ"] = odds_map.get(
-            horse_number
+    if not race_id:
+        return None, (
+            "有効な12桁のレースIDが見つかりません。"
         )
 
-        merged.append(horse_copy)
-
-    race_data = dict(race_data)
-    race_data["horses"] = merged
-
-    valid_odds_count = sum(
-        1
-        for horse in merged
-        if isinstance(horse.get("オッズ"), (int, float))
-        and horse["オッズ"] >= 1.0
-    )
-
-    total_horses = len(merged)
-
-    if total_horses > 0:
-        odds_coverage = (
-            valid_odds_count / total_horses
-        )
-    else:
-        odds_coverage = 0.0
-
-    if odds_coverage >= 0.99:
-        odds_status = "当日確定"
-    elif odds_coverage >= 0.70:
-        odds_status = "当日一部欠損"
-    else:
-        odds_status = "前日暫定 / 未取得"
-
-    style_count = sum(
-        1
-        for horse in merged
-        if horse.get("脚質")
-        and horse.get("脚質") != "不明"
-    )
-
-    style_coverage = (
-        style_count / total_horses
-        if total_horses > 0
-        else 0.0
-    )
-
-    race_data["valid_odds_count"] = valid_odds_count
-    race_data["odds_coverage"] = odds_coverage
-    race_data["odds_status"] = odds_status
-
-    race_data["style_count"] = style_count
-    race_data["style_coverage"] = style_coverage
-
-    race_data["odds_fetch_success"] = odds_data.get(
-        "success",
-        False,
-    )
-
-    race_data["odds_fetch_error"] = odds_data.get(
-        "error"
-    )
-
-    race_data["odds_url"] = odds_data.get(
-        "url",
-        "",
-    )
-
-    return race_data
+    return fetch_netkeiba_race_data_cached(race_id)
 
 
-# =========================================================
-# レースID
-# =========================================================
+# ============================================================
+# 7. モデル
+# ============================================================
 
-def build_race_id(
-    selected_date,
-    venue,
-    kai,
-    nichi,
-    race_number,
-):
-    """
-    JRA/netkeiba 12桁race_id
-    YYYY + 場コード + 回 + 日 + R
-    """
+def safe_log_multiplier(multiplier: float) -> float:
+    return np.log(max(multiplier, 0.01))
 
-    year = selected_date.year
-
-    venue_code = VENUE_CODES.get(
-        venue,
-        "01",
-    )
-
-    return (
-        f"{year:04d}"
-        f"{venue_code}"
-        f"{int(kai):02d}"
-        f"{int(nichi):02d}"
-        f"{int(race_number):02d}"
-    )
-
-
-# =========================================================
-# モデル
-# =========================================================
 
 def calculate_model_score(
     horse,
-    use_front_bias=True,
-    use_inside_bias=True,
-    use_outer_bias=True,
-    use_green_belt=False,
-    use_g1_sign=False,
-    track_type="芝",
-    distance=1200,
+    fetched_info,
+    track_type,
+    distance,
+    front_bias,
+    inside_bias,
+    outer_bias,
+    green_belt,
+    g1_mode,
 ):
-    """
-    市場オッズをモデルスコア生成には使用しない。
-
-    オッズはValue Indexの比較対象としてのみ使用する。
-    """
-
     score = 0.0
 
-    # -----------------------------------------------------
-    # 騎手
-    # -----------------------------------------------------
+    horse_num = int(horse.get("馬番", 0) or 0)
+    waku_num = int(horse.get("枠番", 0) or 0)
 
     jockey = str(
         horse.get("騎手", "")
     ).replace(" ", "").replace("　", "")
 
-    if (
-        "ルメール" in jockey
-        or "川田" in jockey
-    ):
-        score += math.log(1.15)
+    style = str(horse.get("脚質", "不明"))
 
-    # -----------------------------------------------------
-    # 脚質
-    # -----------------------------------------------------
+    total_horses = len(fetched_info["horses"])
 
-    style = str(
-        horse.get("脚質", "")
+    kyaku_rate = (
+        fetched_info["kyaku_count"]
+        / max(total_horses, 1)
     )
 
-    if use_front_bias:
-        if (
-            "逃" in style
-            or "先" in style
-        ):
-            score += math.log(1.08)
-
-    # -----------------------------------------------------
-    # 枠
-    # -----------------------------------------------------
-
-    frame = horse.get("枠")
-
-    try:
-        frame = int(frame)
-    except Exception:
-        frame = None
-
-    if use_inside_bias and frame in [1, 2]:
-        score += math.log(1.05)
-
-    if use_outer_bias and frame in [7, 8]:
-        score += math.log(1.05)
-
-    # -----------------------------------------------------
-    # ダート1200m内枠
-    # -----------------------------------------------------
-
-    try:
-        distance_value = int(distance)
-    except Exception:
-        distance_value = 0
+    if "ルメール" in jockey:
+        score += safe_log_multiplier(1.15)
+    elif "川田" in jockey:
+        score += safe_log_multiplier(1.15)
 
     if (
-        track_type == "ダート"
-        and distance_value == 1200
-        and frame in [1, 2, 3]
+        front_bias
+        and kyaku_rate >= 0.70
+        and style in {"逃", "先"}
     ):
-        score += math.log(1.08)
+        score += safe_log_multiplier(1.08)
 
-    # -----------------------------------------------------
-    # グリーンベルト
-    # -----------------------------------------------------
+    if inside_bias:
+        if waku_num in [1, 2]:
+            score += safe_log_multiplier(1.05)
+        elif waku_num == 0 and horse_num <= 2:
+            score += safe_log_multiplier(1.05)
 
-    if use_green_belt:
-        if horse.get("馬番") == 1:
-            score += math.log(1.06)
+    if outer_bias:
+        if waku_num in [7, 8]:
+            score += safe_log_multiplier(1.05)
+        elif (
+            waku_num == 0
+            and horse_num >= total_horses - 2
+        ):
+            score += safe_log_multiplier(1.05)
 
-    # -----------------------------------------------------
-    # G1サイン
-    # -----------------------------------------------------
+    if track_type == "ダート" and distance == "1200m":
+        if waku_num in [1, 2]:
+            score += safe_log_multiplier(1.08)
 
-    if use_g1_sign:
-        if horse.get("馬番") in [1, 3, 7]:
-            score += math.log(1.03)
+    if green_belt and horse_num == 1:
+        score += safe_log_multiplier(1.06)
+
+    if g1_mode and horse_num in [1, 3, 7]:
+        score += safe_log_multiplier(1.03)
 
     return score
 
 
-def calculate_model_shares(
-    horses,
-    **model_kwargs,
-):
-    if not horses:
-        return []
+def scores_to_probabilities(scores):
+    scores = np.asarray(scores, dtype=float)
 
-    scores = []
+    if len(scores) == 0:
+        return np.array([])
 
-    for horse in horses:
-        score = calculate_model_score(
-            horse,
-            **model_kwargs,
-        )
-
-        scores.append(score)
-
-    # 数値安定化
-    max_score = max(scores)
-
-    exp_scores = [
-        math.exp(score - max_score)
-        for score in scores
-    ]
-
-    total = sum(exp_scores)
+    max_score = np.max(scores)
+    exp_scores = np.exp(scores - max_score)
+    total = np.sum(exp_scores)
 
     if total <= 0:
-        total = 1.0
+        return np.ones(len(scores)) / len(scores)
 
-    result = []
-
-    for horse, score, exp_score in zip(
-        horses,
-        scores,
-        exp_scores,
-    ):
-        item = dict(horse)
-
-        share = exp_score / total
-
-        item["モデルスコア"] = score
-        item["モデルシェア"] = share
-
-        result.append(item)
-
-    return result
+    return exp_scores / total
 
 
-# =========================================================
-# Value Index
-# =========================================================
+def calculate_value_index(
+    model_probability,
+    odds,
+    odds_status,
+):
+    if odds_status not in {
+        "当日確定",
+        "当日一部取得",
+        "一部取得",
+    }:
+        return None
 
-def calculate_value_index(horse):
-    odds = horse.get("オッズ")
-    share = horse.get("モデルシェア")
+    if odds is None:
+        return None
 
-    if not isinstance(odds, (int, float)):
+    try:
+        odds = float(odds)
+    except Exception:
         return None
 
     if odds <= 0:
         return None
 
-    if not isinstance(share, (int, float)):
+    market_implied_probability = 1.0 / odds
+
+    if market_implied_probability <= 0:
         return None
 
-    market_prob = 1.0 / odds
-
-    if market_prob <= 0:
-        return None
-
-    return share / market_prob
-
-
-def add_value_indices(horses, odds_status):
-    result = []
-
-    odds_available = odds_status in [
-        "当日確定",
-        "当日一部欠損",
-    ]
-
-    for horse in horses:
-        item = dict(horse)
-
-        if odds_available:
-            item["Value Index"] = (
-                calculate_value_index(item)
-            )
-        else:
-            item["Value Index"] = None
-
-        result.append(item)
-
-    return result
-
-
-# =========================================================
-# CSV履歴
-# =========================================================
-
-HISTORY_COLUMNS = [
-    "予測ログID",
-    "予測日時",
-    "モデルバージョン",
-    "Race ID",
-    "開催日",
-    "競馬場",
-    "レース名",
-    "距離",
-    "馬場",
-    "馬番",
-    "馬名",
-    "騎手",
-    "斤量",
-    "脚質",
-    "オッズ",
-    "モデルシェア",
-    "Value Index",
-    "順位",
-    "推奨区分",
-    "購入額",
-    "結果",
-    "払戻",
-    "収支",
-    "メモ",
-]
-
-
-def load_history_df():
-    if not os.path.exists(HISTORY_FILE):
-        return pd.DataFrame(
-            columns=HISTORY_COLUMNS
-        )
-
-    try:
-        df = pd.read_csv(
-            HISTORY_FILE,
-            encoding="utf-8-sig",
-        )
-
-        for column in HISTORY_COLUMNS:
-            if column not in df.columns:
-                df[column] = None
-
-        return df[HISTORY_COLUMNS]
-
-    except Exception:
-        return pd.DataFrame(
-            columns=HISTORY_COLUMNS
-        )
-
-
-def save_history_df(df):
-    df.to_csv(
-        HISTORY_FILE,
-        index=False,
-        encoding="utf-8-sig",
+    value_index = (
+        model_probability
+        / market_implied_probability
     )
+
+    return round(float(value_index), 2)
 
 
 def create_prediction_log_id(
     race_id,
+    prediction_time,
 ):
-    timestamp = datetime.now().strftime(
-        "%Y%m%d%H%M%S"
+    raw = (
+        f"{race_id}|"
+        f"{prediction_time}|"
+        f"{VERSION}"
     )
 
-    random_part = uuid.uuid4().hex[:6]
+    digest = hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:12]
 
-    return (
-        f"{race_id}_"
-        f"{timestamp}_"
-        f"{random_part}_"
-        f"{VERSION.replace('.', '')}"
-    )
+    return f"{race_id}-{digest}"
 
 
-def append_prediction_log(
-    race_data,
-    horses,
-    log_id,
-    date_value,
-    track_type,
-    distance,
-    condition,
-    budget,
-):
-    history_df = load_history_df()
+# ============================================================
+# 8. 表示用整形
+# ============================================================
 
-    sorted_horses = sorted(
-        horses,
-        key=lambda x: x.get(
-            "モデルシェア",
-            0,
-        ),
-        reverse=True,
-    )
-
+def build_display_horse_df(horses):
     rows = []
 
-    for rank, horse in enumerate(
-        sorted_horses,
-        start=1,
+    for horse in horses:
+        odds = horse.get("オッズ")
+        kinryo = horse.get("斤量")
+
+        rows.append({
+            "枠番": int(horse.get("枠番", 0) or 0),
+            "馬番": int(horse.get("馬番", 0) or 0),
+            "馬名": str(horse.get("馬名", "")),
+            "騎手": str(horse.get("騎手") or "不明"),
+            "斤量": (
+                f"{float(kinryo):.1f}"
+                if kinryo is not None
+                else "-"
+            ),
+            "脚質": str(horse.get("脚質") or "不明"),
+            "オッズ": (
+                f"{float(odds):.1f}"
+                if odds is not None
+                else "-"
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 9. サイドバー
+# ============================================================
+
+st.sidebar.title("🏇 JRA AI予想 engine")
+st.sidebar.caption(f"モデル: **{VERSION}**")
+
+mode = st.sidebar.radio(
+    "機能メニュー",
+    [
+        "🏇 リアルタイム予想",
+        "📊 成績ダッシュボード・結果入力",
+    ],
+)
+
+
+# ============================================================
+# 10. リアルタイム予想
+# ============================================================
+
+if mode == "🏇 リアルタイム予想":
+
+    st.header("🏇 リアルタイム予想 & スコアリング")
+
+    st.info(
+        "出走馬・騎手・斤量・脚質・枠・コース条件などから"
+        "モデル内相対評価を算出し、その後に市場オッズと"
+        "比較してValue Indexを計算します。"
+    )
+
+    st.markdown("### 📅 対象レース")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        selected_date = st.date_input(
+            "開催日",
+            value=pd.Timestamp.now(),
+        )
+
+    with c2:
+        selected_venue = st.selectbox(
+            "競馬場",
+            JRA_VENUES,
+        )
+
+    with c3:
+        kai_val = st.number_input(
+            "開催回",
+            min_value=1,
+            max_value=6,
+            value=4,
+        )
+
+    with c4:
+        nichi_val = st.number_input(
+            "日目",
+            min_value=1,
+            max_value=12,
+            value=1,
+        )
+
+    c5, c6 = st.columns([1, 2])
+
+    with c5:
+        race_num_val = st.selectbox(
+            "レース番号",
+            [f"{i}R" for i in range(1, 13)],
+            index=0,
+        )
+
+        race_num = int(
+            race_num_val.replace("R", "")
+        )
+
+    auto_race_id = generate_jra_race_id(
+        selected_date.year,
+        selected_venue,
+        kai_val,
+        nichi_val,
+        race_num,
+    )
+
+    with c6:
+        manual_input = st.text_input(
+            "直接URL / 12桁レースID",
+            placeholder=auto_race_id,
+        )
+
+    target_race_id = (
+        extract_race_id(manual_input)
+        if manual_input.strip()
+        else auto_race_id
+    )
+
+    if st.button(
+        "🔄 出走表・最新データ取得",
+        use_container_width=True,
     ):
-        if rank == 1:
-            category = "本命"
-            purchase = budget * 0.50
-        elif rank == 2:
-            category = "相手"
-            purchase = budget * 0.30
-        elif rank == 3:
-            category = "相手"
-            purchase = budget * 0.20
+        with st.spinner(
+            f"レースID {target_race_id} を取得中..."
+        ):
+            info, error = fetch_netkeiba_race_data(
+                target_race_id
+            )
+
+        if error:
+            st.error(error)
         else:
-            category = ""
+            st.session_state["fetched_info"] = info
+            st.session_state["latest_prediction"] = None
+            st.rerun()
 
-            purchase = 0
-
-        rows.append(
-            {
-                "予測ログID": log_id,
-                "予測日時": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "モデルバージョン": VERSION,
-                "Race ID": race_data["race_id"],
-                "開催日": str(date_value),
-                "競馬場": race_data["venue"],
-                "レース名": race_data["race_name"],
-                "距離": (
-                    f"{track_type}{distance}m"
-                    if distance
-                    else ""
-                ),
-                "馬場": condition,
-                "馬番": horse.get("馬番"),
-                "馬名": horse.get("馬名"),
-                "騎手": horse.get("騎手"),
-                "斤量": horse.get("斤量"),
-                "脚質": horse.get("脚質"),
-                "オッズ": horse.get("オッズ"),
-                "モデルシェア": horse.get(
-                    "モデルシェア"
-                ),
-                "Value Index": horse.get(
-                    "Value Index"
-                ),
-                "順位": rank,
-                "推奨区分": category,
-                "購入額": purchase,
-                "結果": "",
-                "払戻": 0,
-                "収支": 0,
-                "メモ": "",
-            }
-        )
-
-    new_df = pd.DataFrame(rows)
-
-    history_df = pd.concat(
-        [
-            history_df,
-            new_df,
-        ],
-        ignore_index=True,
+    fetched_info = st.session_state.get(
+        "fetched_info"
     )
 
-    save_history_df(history_df)
-
-    return history_df
-
-
-# =========================================================
-# UI
-# =========================================================
-
-st.title("🏇 JRA Prediction Engine")
-st.caption(f"{VERSION} | 市場オッズ非依存モデル")
-
-st.divider()
-
-
-# =========================================================
-# サイドバー
-# =========================================================
-
-with st.sidebar:
-    st.header("レース設定")
-
-    selected_date = st.date_input(
-        "開催日",
-        value=date.today(),
-    )
-
-    venue = st.selectbox(
-        "競馬場",
-        list(VENUE_CODES.keys()),
-    )
-
-    kai = st.number_input(
-        "開催回",
-        min_value=1,
-        max_value=6,
-        value=1,
-        step=1,
-    )
-
-    nichi = st.number_input(
-        "開催日目",
-        min_value=1,
-        max_value=12,
-        value=1,
-        step=1,
-    )
-
-    race_number = st.number_input(
-        "レース番号",
-        min_value=1,
-        max_value=12,
-        value=11,
-        step=1,
-    )
-
-    st.divider()
-
-    st.subheader("モデル設定")
-
-    use_front_bias = st.checkbox(
-        "逃げ・先行バイアス",
-        value=True,
-    )
-
-    use_inside_bias = st.checkbox(
-        "内枠バイアス",
-        value=True,
-    )
-
-    use_outer_bias = st.checkbox(
-        "外枠バイアス",
-        value=True,
-    )
-
-    use_green_belt = st.checkbox(
-        "グリーンベルト",
-        value=False,
-    )
-
-    use_g1_sign = st.checkbox(
-        "G1サイン",
-        value=False,
-    )
-
-    st.divider()
-
-    budget = st.number_input(
-        "購入予算",
-        min_value=0,
-        value=10000,
-        step=1000,
-    )
-
-
-# =========================================================
-# Race ID
-# =========================================================
-
-race_id = build_race_id(
-    selected_date,
-    venue,
-    kai,
-    nichi,
-    race_number,
-)
-
-st.subheader("レース情報")
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Race ID",
-        race_id,
-    )
-
-with col2:
-    st.metric(
-        "競馬場",
-        venue,
-    )
-
-with col3:
-    st.metric(
-        "R",
-        f"{race_number}R",
-    )
-
-with col4:
-    st.metric(
-        "モデル",
-        VERSION,
-    )
-
-
-# =========================================================
-# データ取得
-# =========================================================
-
-if st.button(
-    "🔄 出馬表・オッズを取得",
-    type="primary",
-    use_container_width=True,
-):
-    with st.spinner("netkeibaから取得中..."):
-        try:
-            race_data = fetch_race_card(
-                race_id
-            )
-
-            odds_data = fetch_race_odds(
-                race_id
-            )
-
-            race_data = merge_race_data(
-                race_data,
-                odds_data,
-            )
-
-            st.session_state[
-                "race_data"
-            ] = race_data
-
-            st.success(
-                "レースデータを取得しました。"
-            )
-
-        except Exception as e:
-            st.error(
-                f"データ取得エラー: {e}"
-            )
-
-
-# =========================================================
-# セッションから取得
-# =========================================================
-
-race_data = st.session_state.get(
-    "race_data"
-)
-
-if race_data is None:
-    st.info(
-        "「出馬表・オッズを取得」を押してください。"
-    )
-
-    st.stop()
-
-
-# =========================================================
-# レース概要
-# =========================================================
-
-st.subheader(
-    f"{race_data['race_name']}"
-)
-
-info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-
-with info_col1:
-    st.metric(
-        "開催",
-        race_data["venue"],
-    )
-
-with info_col2:
-    distance_text = (
-        f"{race_data['track_type']}"
-        f"{race_data['distance']}m"
-        if race_data["distance"]
-        else "不明"
-    )
-
-    st.metric(
-        "コース",
-        distance_text,
-    )
-
-with info_col3:
-    st.metric(
-        "馬場",
-        race_data["condition"],
-    )
-
-with info_col4:
-    st.metric(
-        "オッズ取得",
-        f"{race_data['valid_odds_count']}"
-        f"/{len(race_data['horses'])}",
-    )
-
-
-# =========================================================
-# 取得診断
-# =========================================================
-
-with st.expander(
-    "🔎 データ取得診断",
-    expanded=False,
-):
-    odds_coverage = race_data.get(
-        "odds_coverage",
-        0,
-    )
-
-    style_coverage = race_data.get(
-        "style_coverage",
-        0,
-    )
-
-    st.write(
-        "**オッズ取得元**: netkeiba 単勝オッズページ"
-    )
-
-    st.write(
-        f"**オッズ取得件数**: "
-        f"{race_data.get('valid_odds_count', 0)}"
-        f"/"
-        f"{len(race_data['horses'])}"
-    )
-
-    st.write(
-        f"**オッズ取得率**: "
-        f"{odds_coverage:.1%}"
-    )
-
-    st.write(
-        f"**脚質取得件数**: "
-        f"{race_data.get('style_count', 0)}"
-        f"/"
-        f"{len(race_data['horses'])}"
-    )
-
-    st.write(
-        f"**脚質取得率**: "
-        f"{style_coverage:.1%}"
-    )
-
-    st.write(
-        f"**オッズ状態**: "
-        f"{race_data.get('odds_status', '不明')}"
-    )
-
-    if race_data.get(
-        "odds_fetch_error"
-    ):
-        st.error(
-            "オッズページ取得エラー: "
-            + str(
-                race_data["odds_fetch_error"]
+    if fetched_info:
+
+        kyaku_rate = (
+            fetched_info["kyaku_count"]
+            / max(
+                len(fetched_info["horses"]),
+                1,
             )
         )
 
-    st.caption(
-        race_data.get(
-            "odds_url",
-            "",
-        )
-    )
-
-    if odds_coverage == 0:
-        st.warning(
-            "単勝オッズを数値として取得できていません。"
-            "発売前などでnetkeiba側が「---.-」の場合も"
-            "ここに含まれます。"
+        st.success(
+            f"✅ **{fetched_info['race_name']}** "
+            f"| {fetched_info['venue']}"
+            f"{fetched_info['race_num']}R "
+            f"| {fetched_info['track_type']}"
+            f"{fetched_info['distance']} "
+            f"| {fetched_info['condition']} "
+            f"| {fetched_info['race_date'].strftime('%Y/%m/%d')}"
         )
 
-    if style_coverage < 0.70:
-        st.warning(
-            "脚質の取得率が70%未満です。"
-            "netkeibaの出馬表HTMLに脚質情報が存在しない場合、"
-            "推測せず「不明」としています。"
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric(
+            "出走頭数",
+            f"{len(fetched_info['horses'])}頭",
         )
 
+        m2.metric(
+            "脚質取得率",
+            f"{kyaku_rate:.0%}",
+        )
 
-# =========================================================
-# モデル計算
-# =========================================================
+        m3.metric(
+            "オッズ取得率",
+            f"{fetched_info['odds_coverage']:.0%}",
+        )
 
-track_type = race_data.get(
-    "track_type",
-    "芝",
-)
+        m4.metric(
+            "オッズ状態",
+            fetched_info["odds_status"],
+        )
 
-distance = race_data.get(
-    "distance",
-    1200,
-)
+        if kyaku_rate < 0.70:
+            st.warning(
+                "脚質取得率が70%未満です。"
+                "取得できた脚質だけを前残り補正に使用します。"
+            )
 
-condition = race_data.get(
-    "condition",
-    "不明",
-)
+        if fetched_info["odds_status"] == "未取得（発売前等）":
+            st.info(
+                "現在オッズを取得できていません。"
+                "発売前などでオッズが未掲載の場合は「-」表示になります。"
+            )
+        elif fetched_info["odds_status"] in {
+            "当日一部取得",
+            "一部取得",
+        }:
+            st.warning(
+                "オッズの一部が取得できていません。"
+                "取得できた馬のみValue Indexを表示します。"
+            )
 
-model_horses = calculate_model_shares(
-    race_data["horses"],
-    use_front_bias=use_front_bias,
-    use_inside_bias=use_inside_bias,
-    use_outer_bias=use_outer_bias,
-    use_green_belt=use_green_belt,
-    use_g1_sign=use_g1_sign,
-    track_type=track_type,
-    distance=distance,
-)
+        with st.expander(
+            "🔎 データ取得診断"
+        ):
+            st.write(
+                f"脚質取得: "
+                f"{fetched_info['kyaku_count']}/"
+                f"{len(fetched_info['horses'])}頭"
+            )
+            st.write(
+                f"オッズ取得: "
+                f"{sum(h.get('オッズ') is not None for h in fetched_info['horses'])}/"
+                f"{len(fetched_info['horses'])}頭"
+            )
+            st.caption(
+                "同一馬番の重複行は自動統合し、"
+                "騎手・斤量・脚質・オッズなど情報量の多い行を採用します。"
+            )
 
-model_horses = add_value_indices(
-    model_horses,
-    race_data.get(
-        "odds_status",
-        "前日暫定 / 未取得",
-    ),
-)
+        with st.expander(
+            "🐎 取得した出走馬データを確認"
+        ):
+            horse_preview = build_display_horse_df(
+                fetched_info["horses"]
+            )
 
+            st.dataframe(
+                horse_preview,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-# =========================================================
-# 表示用DataFrame
-# =========================================================
-
-display_rows = []
-
-for horse in model_horses:
-    share = horse.get(
-        "モデルシェア"
-    )
-
-    value_index = horse.get(
-        "Value Index"
-    )
-
-    display_rows.append(
-        {
-            "枠": horse.get("枠"),
-            "馬番": horse.get("馬番"),
-            "馬名": horse.get("馬名"),
-            "騎手": horse.get("騎手"),
-            "斤量": horse.get("斤量"),
-            "脚質": horse.get("脚質"),
-            "オッズ": horse.get("オッズ"),
-            "モデルシェア": (
-                f"{share:.1%}"
-                if isinstance(
-                    share,
-                    (int, float),
-                )
-                else "-"
-            ),
-            "Value Index": (
-                f"{value_index:.2f}"
-                if isinstance(
-                    value_index,
-                    (int, float),
-                )
-                else "-"
-            ),
-        }
-    )
-
-display_df = pd.DataFrame(
-    display_rows
-)
-
-
-# =========================================================
-# 脚質警告
-# =========================================================
-
-if race_data.get(
-    "style_coverage",
-    0,
-) < 0.70:
-
-    st.warning(
-        "⚠️ 脚質取得率が70%未満です。"
-        "脚質バイアスをONにしている場合、"
-        "脚質が「不明」の馬にはその補正は入りません。"
-    )
-
-
-# =========================================================
-# オッズ状態
-# =========================================================
-
-odds_status = race_data.get(
-    "odds_status",
-    "前日暫定 / 未取得",
-)
-
-if odds_status == "当日確定":
-    st.success(
-        f"💰 オッズ: {odds_status} "
-        f"（{race_data['valid_odds_count']}"
-        f"/{len(race_data['horses'])}頭）"
-    )
-
-elif odds_status == "当日一部欠損":
-    st.warning(
-        f"💰 オッズ: {odds_status} "
-        f"（{race_data['valid_odds_count']}"
-        f"/{len(race_data['horses'])}頭）"
-    )
-
-else:
-    st.info(
-        f"💰 オッズ: {odds_status} "
-        f"（{race_data['valid_odds_count']}"
-        f"/{len(race_data['horses'])}頭）"
-    )
-
-
-# =========================================================
-# 出走馬一覧
-# =========================================================
-
-st.subheader("出走馬・モデル評価")
-
-st.dataframe(
-    display_df,
-    use_container_width=True,
-    hide_index=True,
-)
-
-
-# =========================================================
-# 上位馬
-# =========================================================
-
-ranked_horses = sorted(
-    model_horses,
-    key=lambda x: x.get(
-        "モデルシェア",
-        0,
-    ),
-    reverse=True,
-)
-
-if ranked_horses:
-
-    top1 = ranked_horses[0]
-
-    st.subheader("🎯 モデル上位")
+    st.markdown("### ⚙️ モデル条件")
 
     c1, c2, c3 = st.columns(3)
 
+    default_track = (
+        fetched_info["track_type"]
+        if fetched_info
+        else "芝"
+    )
+
     with c1:
-        st.metric(
-            "本命",
-            f"{top1['馬番']} "
-            f"{top1['馬名']}",
+        track_type = st.selectbox(
+            "コース種別",
+            ["芝", "ダート", "障害"],
+            index=[
+                "芝", "ダート", "障害"
+            ].index(default_track),
         )
 
-        st.caption(
-            f"モデルシェア "
-            f"{top1['モデルシェア']:.1%}"
+    if track_type == "芝":
+        distance_options = TURF_DISTANCES + ["その他"]
+    elif track_type == "ダート":
+        distance_options = DIRT_DISTANCES + ["その他"]
+    else:
+        distance_options = ALL_DISTANCES_WITH_OTHER
+
+    default_distance = (
+        fetched_info["distance"]
+        if fetched_info
+        else "1600m"
+    )
+
+    with c2:
+        distance = st.selectbox(
+            "距離",
+            distance_options,
+            index=(
+                distance_options.index(
+                    default_distance
+                )
+                if default_distance in distance_options
+                else len(distance_options) - 1
+            ),
         )
 
-    if len(ranked_horses) >= 2:
-        top2 = ranked_horses[1]
+    if distance == "その他":
+        custom_distance = st.text_input(
+            "手動距離",
+            value="",
+        )
+        final_distance = (
+            custom_distance
+            if custom_distance
+            else "その他"
+        )
+    else:
+        final_distance = distance
 
-        with c2:
-            st.metric(
-                "相手1",
-                f"{top2['馬番']} "
-                f"{top2['馬名']}",
-            )
-
-            st.caption(
-                f"モデルシェア "
-                f"{top2['モデルシェア']:.1%}"
-            )
-
-    if len(ranked_horses) >= 3:
-        top3 = ranked_horses[2]
-
-        with c3:
-            st.metric(
-                "相手2",
-                f"{top3['馬番']} "
-                f"{top3['馬名']}",
-            )
-
-            st.caption(
-                f"モデルシェア "
-                f"{top3['モデルシェア']:.1%}"
-            )
-
-
-# =========================================================
-# Value Index 上位
-# =========================================================
-
-valid_value_horses = [
-    horse
-    for horse in model_horses
-    if isinstance(
-        horse.get("Value Index"),
-        (int, float),
-    )
-]
-
-if valid_value_horses:
-
-    value_sorted = sorted(
-        valid_value_horses,
-        key=lambda x: x["Value Index"],
-        reverse=True,
+    default_condition = (
+        fetched_info["condition"]
+        if fetched_info
+        else "良"
     )
 
-    st.subheader("💎 Value Index 上位")
+    with c3:
+        condition = st.selectbox(
+            "馬場状態",
+            ["良", "稍重", "重", "不良"],
+            index=(
+                ["良", "稍重", "重", "不良"].index(
+                    default_condition
+                )
+                if default_condition in [
+                    "良", "稍重", "重", "不良"
+                ]
+                else 0
+            ),
+        )
 
-    value_rows = []
+    st.markdown("### 🎛️ 補正設定")
 
-    for horse in value_sorted[:5]:
-        value_rows.append(
-            {
-                "馬番": horse["馬番"],
-                "馬名": horse["馬名"],
-                "オッズ": horse["オッズ"],
-                "モデルシェア": (
-                    f"{horse['モデルシェア']:.1%}"
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+        front_bias = st.checkbox(
+            "前残り補正",
+            value=True,
+        )
+
+        inside_bias = st.checkbox(
+            "内枠補正",
+            value=False,
+        )
+
+    with b2:
+        outer_bias = st.checkbox(
+            "外差し補正",
+            value=False,
+        )
+
+        green_belt = st.checkbox(
+            "グリーンベルト補正",
+            value=False,
+        )
+
+    with b3:
+        g1_mode = st.checkbox(
+            "G1サインモード",
+            value=False,
+        )
+
+        confidence = st.select_slider(
+            "勝負度",
+            options=[
+                "★☆☆",
+                "★★☆",
+                "★★★",
+            ],
+            value="★★☆",
+        )
+
+    budget = st.number_input(
+        "参考予算",
+        min_value=100,
+        value=1000,
+        step=100,
+    )
+
+    run_disabled = fetched_info is None
+
+    if run_disabled:
+        st.info("まず出走表を取得してください。")
+
+    if st.button(
+        "🚀 モデル予想を実行",
+        disabled=run_disabled,
+        use_container_width=True,
+    ):
+
+        horses = fetched_info["horses"]
+
+        scores = []
+
+        for horse in horses:
+            score = calculate_model_score(
+                horse=horse,
+                fetched_info=fetched_info,
+                track_type=track_type,
+                distance=final_distance,
+                front_bias=front_bias,
+                inside_bias=inside_bias,
+                outer_bias=outer_bias,
+                green_belt=green_belt,
+                g1_mode=g1_mode,
+            )
+            scores.append(score)
+
+        probabilities = scores_to_probabilities(
+            scores
+        )
+
+        result_rows = []
+
+        for i, horse in enumerate(horses):
+
+            model_probability = probabilities[i]
+            odds = horse.get("オッズ")
+
+            value_index = calculate_value_index(
+                model_probability,
+                odds,
+                fetched_info["odds_status"],
+            )
+
+            result_rows.append({
+                "枠番": int(horse.get("枠番", 0) or 0),
+                "馬番": int(horse.get("馬番", 0) or 0),
+                "馬名": str(horse.get("馬名", "")),
+                "騎手": str(horse.get("騎手") or "不明"),
+                "斤量": (
+                    float(horse["斤量"])
+                    if horse.get("斤量") is not None
+                    else np.nan
+                ),
+                "脚質": str(horse.get("脚質") or "不明"),
+                "単勝オッズ": (
+                    float(odds)
+                    if odds is not None
+                    else np.nan
+                ),
+                "モデル確率(%)": round(
+                    model_probability * 100,
+                    2,
                 ),
                 "Value Index": (
-                    f"{horse['Value Index']:.2f}"
+                    value_index
+                    if value_index is not None
+                    else np.nan
                 ),
-            }
-        )
+            })
 
-    st.dataframe(
-        pd.DataFrame(value_rows),
-        use_container_width=True,
-        hide_index=True,
-    )
+        result_df = pd.DataFrame(result_rows)
 
-else:
-    st.info(
-        "Value Indexは有効な単勝オッズ取得後に表示されます。"
-    )
-
-
-# =========================================================
-# 50/30/20 購入配分
-# =========================================================
-
-st.subheader("💰 購入配分")
-
-if len(ranked_horses) >= 3:
-
-    purchase_rows = [
-        {
-            "区分": "本命",
-            "馬番": ranked_horses[0]["馬番"],
-            "馬名": ranked_horses[0]["馬名"],
-            "割合": "50%",
-            "金額": int(budget * 0.50),
-        },
-        {
-            "区分": "相手1",
-            "馬番": ranked_horses[1]["馬番"],
-            "馬名": ranked_horses[1]["馬名"],
-            "割合": "30%",
-            "金額": int(budget * 0.30),
-        },
-        {
-            "区分": "相手2",
-            "馬番": ranked_horses[2]["馬番"],
-            "馬名": ranked_horses[2]["馬名"],
-            "割合": "20%",
-            "金額": int(budget * 0.20),
-        },
-    ]
-
-    st.dataframe(
-        pd.DataFrame(purchase_rows),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# =========================================================
-# 予測保存
-# =========================================================
-
-st.divider()
-
-st.subheader("💾 予測を保存")
-
-st.caption(
-    "同じレースでも予測するたびに別ログとして保存されます。"
-)
-
-if st.button(
-    "この予測を履歴に保存",
-    type="primary",
-):
-    log_id = create_prediction_log_id(
-        race_id
-    )
-
-    append_prediction_log(
-        race_data=race_data,
-        horses=model_horses,
-        log_id=log_id,
-        date_value=selected_date,
-        track_type=track_type,
-        distance=distance,
-        condition=condition,
-        budget=budget,
-    )
-
-    st.success(
-        f"予測を保存しました。"
-        f"ログID: {log_id}"
-    )
-
-
-# =========================================================
-# 履歴・成績
-# =========================================================
-
-st.divider()
-
-st.subheader("📊 予測履歴")
-
-history_df = load_history_df()
-
-if history_df.empty:
-
-    st.info(
-        "まだ予測履歴がありません。"
-    )
-
-else:
-
-    total_predictions = (
-        history_df["予測ログID"]
-        .nunique()
-    )
-
-    confirmed_df = history_df[
-        history_df["結果"].fillna("").astype(str).str.strip() != ""
-    ]
-
-    confirmed_logs = (
-        confirmed_df["予測ログID"]
-        .nunique()
-    )
-
-    total_profit = pd.to_numeric(
-        history_df["収支"],
-        errors="coerce",
-    ).fillna(0).sum()
-
-    m1, m2, m3 = st.columns(3)
-
-    with m1:
-        st.metric(
-            "予測数",
-            total_predictions,
-        )
-
-    with m2:
-        st.metric(
-            "確定数",
-            confirmed_logs,
-        )
-
-    with m3:
-        st.metric(
-            "累計収支",
-            f"{total_profit:,.0f}円",
-        )
-
-    st.dataframe(
-        history_df.sort_values(
-            "予測日時",
+        result_df = result_df.sort_values(
+            by="モデル確率(%)",
             ascending=False,
-        ),
-        use_container_width=True,
-        hide_index=True,
+        ).reset_index(drop=True)
+
+        # 馬番が重複していないことを最後にも確認
+        result_df = result_df.drop_duplicates(
+            subset=["馬番"],
+            keep="first",
+        ).reset_index(drop=True)
+
+        top_horse = result_df.iloc[0]["馬名"]
+
+        partners = result_df.iloc[
+            1:3
+        ]["馬名"].tolist()
+
+        partner_horses = ", ".join(partners)
+
+        top_odds = result_df.iloc[0]["単勝オッズ"]
+
+        top_odds_value = (
+            float(top_odds)
+            if pd.notna(top_odds)
+            else 0.0
+        )
+
+        active_biases = []
+
+        if front_bias:
+            active_biases.append("前残り")
+        if inside_bias:
+            active_biases.append("内枠")
+        if outer_bias:
+            active_biases.append("外差し")
+        if green_belt:
+            active_biases.append("グリーンベルト")
+        if g1_mode:
+            active_biases.append("G1サイン")
+
+        bias_text = (
+            ",".join(active_biases)
+            if active_biases
+            else "なし"
+        )
+
+        prediction_time = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        prediction_log_id = create_prediction_log_id(
+            fetched_info["race_id"],
+            prediction_time,
+        )
+
+        st.session_state["latest_prediction"] = {
+            "prediction_log_id": prediction_log_id,
+            "race_id": fetched_info["race_id"],
+            "race_name": fetched_info["race_name"],
+            "race_date": fetched_info["race_date"].strftime(
+                "%Y-%m-%d"
+            ),
+            "predict_time": prediction_time,
+            "data_fetched_at": fetched_info["fetched_at"].strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "course": (
+                f"{fetched_info['venue']}{track_type}"
+            ),
+            "distance": final_distance,
+            "condition": condition,
+            "head_count": len(horses),
+            "confidence": confidence,
+            "result_df": result_df,
+            "top_horse": top_horse,
+            "partner_horses": partner_horses,
+            "top_odds": top_odds_value,
+            "budget": budget,
+            "bias_text": bias_text,
+            "odds_status": fetched_info["odds_status"],
+            "odds_coverage": fetched_info["odds_coverage"],
+        }
+
+        st.success("予想計算が完了しました。")
+
+    latest = st.session_state.get(
+        "latest_prediction"
     )
 
-    csv_data = history_df.to_csv(
-        index=False,
-        encoding="utf-8-sig",
-    )
+    if latest:
 
-    st.download_button(
-        "📥 履歴CSVをダウンロード",
-        data=csv_data,
-        file_name=HISTORY_FILE,
-        mime="text/csv",
-    )
+        st.markdown("### 📊 出走馬・モデル評価")
 
+        st.caption(
+            "オッズ未取得の場合は「-」で表示します。"
+            "脚質は通常出馬表に加えて過去走表示ページから補完します。"
+        )
 
-# =========================================================
-# 結果入力
-# =========================================================
+        display_df = latest["result_df"].copy()
 
-st.divider()
+        # None / NaNを画面上で「-」に統一
+        display_df["斤量"] = display_df["斤量"].apply(
+            lambda x: f"{float(x):.1f}"
+            if pd.notna(x)
+            else "-"
+        )
 
-st.subheader("📝 予測結果の確認")
+        display_df["単勝オッズ"] = display_df[
+            "単勝オッズ"
+        ].apply(
+            lambda x: f"{float(x):.1f}"
+            if pd.notna(x)
+            else "-"
+        )
 
-if history_df.empty:
-
-    st.info(
-        "保存済みの予測がありません。"
-    )
-
-else:
-
-    log_ids = (
-        history_df["予測ログID"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    selected_log_id = st.selectbox(
-        "予測ログID",
-        log_ids,
-    )
-
-    selected_rows = history_df[
-        history_df["予測ログID"].astype(str)
-        == str(selected_log_id)
-    ].copy()
-
-    if not selected_rows.empty:
+        display_df["Value Index"] = display_df[
+            "Value Index"
+        ].apply(
+            lambda x: f"{float(x):.2f}"
+            if pd.notna(x)
+            else "-"
+        )
 
         st.dataframe(
-            selected_rows[
-                [
-                    "順位",
-                    "馬番",
-                    "馬名",
-                    "オッズ",
-                    "モデルシェア",
-                    "Value Index",
-                    "推奨区分",
-                    "購入額",
-                    "結果",
-                    "払戻",
-                    "収支",
-                ]
-            ],
+            display_df,
             use_container_width=True,
             hide_index=True,
         )
 
-        result_options = [
-            "",
-            "的中",
-            "不的中",
-            "取消",
-            "中止",
-        ]
+        r1, r2, r3 = st.columns(3)
 
-        result = st.selectbox(
-            "結果",
-            result_options,
+        with r1:
+            st.subheader(
+                f"◎ モデル1位: {latest['top_horse']}"
+            )
+            st.write(
+                f"相手: {latest['partner_horses']}"
+            )
+
+        with r2:
+            st.subheader("📡 データ状態")
+            st.write(
+                f"オッズ: {latest['odds_status']}"
+            )
+            st.write(
+                f"取得率: {latest['odds_coverage']:.0%}"
+            )
+
+        with r3:
+            st.subheader("⚙️ 設定")
+            st.write(
+                f"勝負度: {latest['confidence']}"
+            )
+            st.write(
+                f"補正: {latest['bias_text']}"
+            )
+
+        st.markdown("### 💎 Value Index候補")
+
+        raw_value = pd.to_numeric(
+            latest["result_df"]["Value Index"],
+            errors="coerce",
         )
 
-        payout = st.number_input(
-            "払戻合計",
-            min_value=0,
-            value=0,
-            step=100,
+        value_candidates = latest[
+            "result_df"
+        ].loc[
+            raw_value > 1
+        ].copy()
+
+        if value_candidates.empty:
+            st.info(
+                "Value Index > 1.00 の馬はありません。"
+            )
+        else:
+            value_display = value_candidates.copy()
+
+            value_display["斤量"] = value_display[
+                "斤量"
+            ].apply(
+                lambda x: f"{float(x):.1f}"
+                if pd.notna(x)
+                else "-"
+            )
+
+            value_display["単勝オッズ"] = value_display[
+                "単勝オッズ"
+            ].apply(
+                lambda x: f"{float(x):.1f}"
+                if pd.notna(x)
+                else "-"
+            )
+
+            value_display["Value Index"] = value_display[
+                "Value Index"
+            ].apply(
+                lambda x: f"{float(x):.2f}"
+                if pd.notna(x)
+                else "-"
+            )
+
+            st.dataframe(
+                value_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.warning(
+            "⚠️ Value Index > 1.00 は、モデル評価と市場オッズの"
+            "比率が1を超えていることを示すだけで、"
+            "的中・利益・期待値を保証するものではありません。"
         )
 
-        memo = st.text_area(
-            "メモ",
+        st.markdown("### 💰 参考資金配分")
+
+        budget_amount = float(
+            latest["budget"]
         )
+
+        model_df = latest[
+            "result_df"
+        ].head(3).copy()
+
+        if len(model_df) > 0:
+
+            raw_weights = np.array(
+                [0.50, 0.30, 0.20][:len(model_df)],
+                dtype=float,
+            )
+
+            raw_weights = (
+                raw_weights
+                / raw_weights.sum()
+            )
+
+            allocation_rows = []
+
+            for i, (_, row) in enumerate(
+                model_df.iterrows()
+            ):
+                allocation_rows.append({
+                    "順位": i + 1,
+                    "馬名": row["馬名"],
+                    "モデル確率": row["モデル確率(%)"],
+                    "参考配分": int(
+                        budget_amount
+                        * raw_weights[i]
+                    ),
+                })
+
+            allocation_df = pd.DataFrame(
+                allocation_rows
+            )
+
+            st.dataframe(
+                allocation_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(
+            "※ 上記はモデル順位に基づく固定比率の参考表示です。"
+        )
+
+        st.markdown("---")
 
         if st.button(
-            "結果を保存",
+            "📥 この予想ログを保存",
+            use_container_width=True,
         ):
 
             history_df = load_history_df()
 
-            mask = (
-                history_df["予測ログID"].astype(str)
-                == str(selected_log_id)
+            new_record = {
+                "予測ログID": latest["prediction_log_id"],
+                "レースID": latest["race_id"],
+                "レース名": latest["race_name"],
+                "開催日": latest["race_date"],
+                "予想日時": latest["predict_time"],
+                "データ取得日時": latest["data_fetched_at"],
+                "コース": latest["course"],
+                "距離": latest["distance"],
+                "馬場状態": latest["condition"],
+                "出走頭数": latest["head_count"],
+                "勝負度": latest["confidence"],
+                "軸馬": latest["top_horse"],
+                "相手馬": latest["partner_horses"],
+                "軸馬オッズ": latest["top_odds"],
+                "バイアス履歴": latest["bias_text"],
+                "モデルバージョン": VERSION,
+                "確定フラグ": "未確定",
+                "回収額": 0,
+                "収支": 0,
+                "メモ": "",
+                "投資額": latest["budget"],
+                "オッズ状態": latest["odds_status"],
+                "オッズ取得率": latest["odds_coverage"],
+            }
+
+            already_exists = (
+                not history_df.empty
+                and (
+                    history_df["予測ログID"]
+                    .astype(str)
+                    == str(
+                        latest["prediction_log_id"]
+                    )
+                ).any()
             )
 
-            history_df.loc[
-                mask,
-                "結果"
-            ] = result
+            if already_exists:
+                st.warning(
+                    "この予測ログは既に保存されています。"
+                )
+            else:
+                updated_df = pd.concat(
+                    [
+                        history_df,
+                        pd.DataFrame([new_record]),
+                    ],
+                    ignore_index=True,
+                )
 
-            history_df.loc[
-                mask,
-                "払戻"
-            ] = payout
+                if save_history_df(updated_df):
+                    st.success(
+                        "✅ 予測ログを保存しました。"
+                    )
 
-            total_bet = pd.to_numeric(
-                history_df.loc[
-                    mask,
-                    "購入額",
-                ],
-                errors="coerce",
-            ).fillna(0).sum()
 
-            profit = (
-                payout
-                - total_bet
+# ============================================================
+# 11. 成績ダッシュボード
+# ============================================================
+
+elif mode == "📊 成績ダッシュボード・結果入力":
+
+    st.header("📊 成績ダッシュボード")
+
+    df = load_history_df()
+
+    if df.empty:
+        st.info("まだ予測履歴がありません。")
+        st.stop()
+
+    df = sanitize_df_types(df)
+
+    confirmed_df = df[
+        df["確定フラグ"] == "確定"
+    ].copy()
+
+    total_logs = len(df)
+    confirmed_logs = len(confirmed_df)
+
+    total_investment = (
+        confirmed_df["投資額"].astype(float).sum()
+        if not confirmed_df.empty
+        else 0
+    )
+
+    total_return = (
+        confirmed_df["回収額"].astype(float).sum()
+        if not confirmed_df.empty
+        else 0
+    )
+
+    total_balance = (
+        total_return - total_investment
+    )
+
+    recovery_rate = (
+        total_return / total_investment * 100
+        if total_investment > 0
+        else 0
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric(
+        "予測ログ数",
+        f"{total_logs:,}",
+    )
+
+    m2.metric(
+        "確定ログ数",
+        f"{confirmed_logs:,}",
+    )
+
+    m3.metric(
+        "回収率",
+        f"{recovery_rate:.1f}%",
+    )
+
+    m4.metric(
+        "累計収支",
+        f"{int(total_balance):+,}円",
+    )
+
+    st.markdown("### 📡 オッズ状態別ログ")
+
+    odds_summary = (
+        df.groupby("オッズ状態")
+        .size()
+        .reset_index(name="件数")
+    )
+
+    st.dataframe(
+        odds_summary,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+    st.subheader("📝 未確定ログの結果入力")
+
+    unconfirmed_df = df[
+        df["確定フラグ"] == "未確定"
+    ].copy()
+
+    if unconfirmed_df.empty:
+
+        st.info("現在、未確定ログはありません。")
+
+    else:
+
+        with st.form("result_update_form"):
+
+            options = []
+
+            for _, row in unconfirmed_df.iterrows():
+                options.append(
+                    f"{row['予測ログID']} | "
+                    f"{row['開催日']} | "
+                    f"{row['レース名']} | "
+                    f"{row['予想日時']} | "
+                    f"{row['オッズ状態']}"
+                )
+
+            selected_option = st.selectbox(
+                "結果を入力する予測ログ",
+                options,
             )
 
-            history_df.loc[
-                mask,
-                "収支"
-            ] = profit
-
-            history_df.loc[
-                mask,
-                "メモ"
-            ] = memo
-
-            save_history_df(
-                history_df
+            selected_position = options.index(
+                selected_option
             )
 
-            st.success(
-                "結果を保存しました。"
+            selected_row = unconfirmed_df.iloc[
+                selected_position
+            ]
+
+            st.caption(
+                f"レース: **{selected_row['レース名']}** "
+                f"| 軸: **{selected_row['軸馬']}** "
+                f"| 投資: **{selected_row['投資額']}円**"
             )
 
-            st.rerun()
+            input_return = st.number_input(
+                "回収額 / 払戻金",
+                min_value=0,
+                value=0,
+                step=100,
+            )
 
+            input_memo = st.text_input(
+                "メモ",
+                value="",
+            )
 
-# =========================================================
-# フッター
-# =========================================================
+            submit = st.form_submit_button(
+                "確定成績を保存"
+            )
 
-st.divider()
+            if submit:
 
-st.caption(
-    f"JRA Prediction Engine {VERSION} | "
-    "モデルスコアと市場オッズを分離して管理"
-)
+                target_log_id = selected_row[
+                    "予測ログID"
+                ]
+
+                match_idx = df[
+                    df["予測ログID"].astype(str)
+                    == str(target_log_id)
+                ].index
+
+                if match_idx.empty:
+                    st.error("対象ログが見つかりません。")
+                else:
+                    idx = match_idx[0]
+
+                    investment = float(
+                        df.loc[idx, "投資額"]
+                    )
+
+                    df.loc[idx, "確定フラグ"] = "確定"
+                    df.loc[idx, "回収額"] = input_return
+                    df.loc[idx, "収支"] = (
+                        input_return - investment
+                    )
+                    df.loc[idx, "メモ"] = input_memo
+
+                    if save_history_df(df):
+                        st.success(
+                            "✅ 確定成績を保存しました。"
+                        )
+                        st.rerun()
+
+    st.markdown("---")
+    st.subheader("📋 全予測ログ")
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        label="📥 CSVをダウンロード",
+        data=df.to_csv(
+            index=False,
+            encoding="utf-8-sig",
+        ),
+        file_name=CSV_FILENAME,
+        mime="text/csv",
+        use_container_width=True,
+    )
