@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime
 
 # ================================================================
-# Ver.2.39 脚質最終抽出強化
+# Ver.2.40 脚質最終抽出強化
 # ================================================================
 def extract_style_from_all_attributes_v239(node) -> str:
     """HTML属性・class・style・script文字列から脚質記号を抽出する。"""
@@ -86,7 +86,7 @@ def extract_style_from_current_race_row_v239(row) -> str:
 
 
 # ================================================================
-# Ver.2.39 脚質最終フォールバック
+# Ver.2.40 脚質最終フォールバック
 # ================================================================
 def _final_kyakushitsu_fallback(row, horse_name="", horse_url=""):
     """
@@ -156,7 +156,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.39"
+VERSION = "Ver.2.40"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -695,6 +695,103 @@ def extract_odds_from_row(row):
     return None
 
 
+
+def extract_style_by_exact_horse_name_v240(soup, horse_name: str) -> str:
+    """
+    過去走ページで対象馬名を含む行を直接探し、
+    「Image先中15週」のような脚質表記を抽出する。
+    馬番検索に依存しないため、馬番13のような取りこぼしを防ぐ。
+    """
+    if soup is None or not horse_name:
+        return "不明"
+
+    target = normalize_text(horse_name)
+    if not target:
+        return "不明"
+
+    # まず馬名リンク、次にテキストノード、最後にtr全体。
+    candidate_rows = []
+
+    for a in soup.find_all("a", href=True):
+        txt = normalize_text(a.get_text(" ", strip=True))
+        if txt == target or target in txt or txt in target:
+            row = a.find_parent("tr")
+            if row is not None:
+                candidate_rows.append(row)
+
+    for row in soup.find_all("tr"):
+        txt = normalize_text(row.get_text(" ", strip=True))
+        if target in txt:
+            candidate_rows.append(row)
+
+    seen = set()
+    for row in candidate_rows:
+        if id(row) in seen:
+            continue
+        seen.add(id(row))
+
+        values = [row.get_text(" ", strip=True), str(row)]
+
+        for tag in row.find_all(True):
+            values.append(tag.get_text(" ", strip=True))
+            for attr in ("alt", "title", "aria-label"):
+                val = tag.get(attr)
+                if val:
+                    values.append(str(val))
+
+            for attr, val in tag.attrs.items():
+                if (
+                    "style" in str(attr).lower()
+                    or "kyaku" in str(attr).lower()
+                    or "running" in str(attr).lower()
+                    or str(attr).lower().startswith("data-")
+                ):
+                    values.append(str(val))
+
+        for value in values:
+            value = normalize_text(value)
+            if not value:
+                continue
+
+            # netkeibaの代表表記
+            m = re.search(
+                r"Image(逃|先|差|追)(?:中\d+週|中\d+ヶ月|初出走)",
+                value
+            )
+            if m:
+                return m.group(1)
+
+            # Imageが消えている場合
+            m = re.search(
+                r"(逃|先|差|追)中\d+(?:週|ヶ月)",
+                value
+            )
+            if m:
+                return m.group(1)
+
+            m = re.search(r"(逃|先|差|追)初出走", value)
+            if m:
+                return m.group(1)
+
+            # 通過順位しかない場合も補完
+            m = re.search(
+                r"(?<!\d)(\d{1,2})[-－](\d{1,2})[-－]"
+                r"(\d{1,2})[-－](\d{1,2})(?!\d)",
+                value
+            )
+            if m:
+                pos = int(m.group(4))
+                if pos <= 2:
+                    return "逃"
+                if pos <= 5:
+                    return "先"
+                if pos <= 10:
+                    return "差"
+                return "追"
+
+    return "不明"
+
+
 def extract_style_from_text(text: str) -> str:
     """
     netkeibaの脚質表記を抽出する。
@@ -1014,7 +1111,7 @@ def extract_style_from_past_page(
     if row is None:
         return "不明"
 
-    # Ver.2.39: 対象rowの生HTML・属性を最優先で調査。
+    # Ver.2.40: 対象rowの生HTML・属性を最優先で調査。
     # 「Image先中13週」等がget_text()に出ない場合にも対応。
     raw_row_v237 = str(row)
     for pat in (
@@ -1856,6 +1953,20 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                         style = past_style
                         style_source = "過去走"
 
+                # Ver.2.40: 馬名一致による過去走HTML直接検索
+                if style == "不明" and past_soup is not None:
+                    try:
+                        exact_name_style = extract_style_by_exact_horse_name_v240(
+                            past_soup,
+                            horse_name,
+                        )
+                    except Exception:
+                        exact_name_style = "不明"
+
+                    if exact_name_style != "不明":
+                        style = exact_name_style
+                        style_source = "過去走・馬名一致"
+
                 if style == "不明" and past_soup is not None:
                     try:
                         robust_style = extract_style_from_past_html_robust(
@@ -1888,6 +1999,19 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     if inferred_style != "不明":
                         style = inferred_style
                         style_source = "過去走・通過順位推定"
+
+                if style == "不明" and past_soup is not None:
+                    try:
+                        exact_name_style = extract_style_by_exact_horse_name_v240(
+                            past_soup,
+                            horse_name,
+                        )
+                    except Exception:
+                        exact_name_style = "不明"
+
+                    if exact_name_style != "不明":
+                        style = exact_name_style
+                        style_source = "過去走・馬名一致"
 
                 if style == "不明":
                     try:
@@ -1972,7 +2096,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             item.pop("_quality", None)
             horses.append(item)
 
-        # Ver.2.39: 脚質が取れていない馬だけ最終補完
+        # Ver.2.40: 脚質が取れていない馬だけ最終補完
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
             _source = str(_horse.get("脚質取得元", "") or "").strip()
@@ -1994,7 +2118,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
         if not horses:
             return None, "出走馬データの抽出件数が0件です。"
 
-        # Ver.2.39: 脚質が1頭だけ落ちるケースへの個別馬ページ補完
+        # Ver.2.40: 脚質が1頭だけ落ちるケースへの個別馬ページ補完
         # 既存の脚質取得を優先し、未取得馬だけ実行する。
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
@@ -2047,7 +2171,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             except Exception:
                 pass
 
-        # Ver.2.39: 現在の出馬表rowから脚質を最終取得。
+        # Ver.2.40: 現在の出馬表rowから脚質を最終取得。
         # 過去走側の馬番検索に失敗しても、出馬表側に脚質情報があれば復元する。
         for _horse in horses:
             _style = str(_horse.get("脚質", "") or "").strip()
