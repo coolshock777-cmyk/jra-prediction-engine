@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.26"
+VERSION = "Ver.2.31"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -1507,204 +1507,193 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
         # ----------------------------------------------------
         # 出走馬
         # ----------------------------------------------------
-        horse_rows = soup.find_all(
-            "tr",
-            class_="HorseList",
-        )
 
-        # ----------------------------------------------------
-        # 出馬表HTMLのフォールバック
-        # ----------------------------------------------------
-        # netkeiba側のHTML/CSS変更や一時的な部分HTMLで
-        # HorseList が一部しか返らない場合に備え、
-        # 馬DBリンクを持つ行も候補にする。
-        # 東京1Rのような15頭立てを3頭だけ取得するケースを防ぐ。
+        # ========================================================
+        # 出走馬抽出 Ver.2.31
+        # ========================================================
+        # HorseList classだけに依存せず、出馬表の全<tr>を走査する。
+        # class名変更時も、馬番・馬名リンクを使って復元する。
+        all_rows = soup.find_all("tr")
+
+        horse_rows = []
+        for row in all_rows:
+            cls = " ".join(row.get("class", []))
+            if (
+                "HorseList" in cls
+                or row.find("td", class_=re.compile(r"Umaban", re.I))
+                or row.find("td", class_=re.compile(r"Waku", re.I))
+            ):
+                horse_rows.append(row)
+
+        # HorseListが少ない場合のフォールバック
         if len(horse_rows) < 5:
-            fallback_rows = []
-            for tr in soup.find_all("tr"):
-                if tr.find("a", href=re.compile(r"/horse/")):
-                    fallback_rows.append(tr)
+            horse_rows = [
+                row for row in all_rows
+                if row.find("a", href=re.compile(r"/horse/", re.I))
+            ]
 
-            if len(fallback_rows) > len(horse_rows):
-                horse_rows = fallback_rows
-
-        if not horse_rows:
-            return None, (
-                "出走馬テーブルが見つかりませんでした。"
-            )
-
-        # 同じ馬番の重複行が出るケースがあるため、
-        # 馬番をキーに統合する。
-        horse_map = {}
+        horses_by_number = {}
 
         for row in horse_rows:
             try:
-                waku = extract_number_by_class(
-                    row,
-                    r"Waku",
+                # 馬番
+                uma_elem = row.find(
+                    "td", class_=re.compile(r"Umaban", re.I)
                 )
-
-                uma = extract_number_by_class(
-                    row,
-                    r"Umaban",
+                uma_text = (
+                    uma_elem.get_text(" ", strip=True)
+                    if uma_elem else ""
                 )
+                uma_match = re.search(r"(?<!\d)(1[0-8]|[1-9])(?!\d)", uma_text)
 
-                if uma <= 0:
-                    fb_waku, fb_uma = extract_waku_uma_fallback(row)
-                    if fb_uma > 0:
-                        waku = fb_waku
-                        uma = fb_uma
+                if not uma_match:
+                    # 馬名リンクの周辺テキストから補完
+                    row_text = row.get_text(" ", strip=True)
+                    uma_match = re.search(
+                        r"(?<!\d)(1[0-8]|[1-9])(?=\s+)",
+                        row_text
+                    )
 
-                if uma <= 0:
+                if not uma_match:
                     continue
 
-                horse_name = extract_horse_name(row)
+                uma = int(uma_match.group(1))
+                if not 1 <= uma <= 18:
+                    continue
+
+                # 馬名
+                horse_elem = row.find(
+                    "span", class_=re.compile(r"HorseName", re.I)
+                )
+                if not horse_elem:
+                    horse_elem = row.find(
+                        "a", href=re.compile(r"/horse/", re.I)
+                    )
+
+                horse_name = (
+                    horse_elem.get_text(" ", strip=True)
+                    if horse_elem else ""
+                )
 
                 if not horse_name:
                     continue
 
-                jockey = extract_jockey(row)
-                trainer = extract_trainer(row)
-                kinryo = extract_kinryo(row)
-                # HTML側のオッズは ---.- のプレースホルダになるため、
-                # 実値はAPIを最優先する。
-                odds = api_odds_map.get(uma)
-                if odds is None:
-                    odds = extract_odds_from_row(row)
+                # 枠番
+                waku_elem = row.find(
+                    "td", class_=re.compile(r"Waku", re.I)
+                )
+                waku_text = (
+                    waku_elem.get_text(" ", strip=True)
+                    if waku_elem else ""
+                )
+                waku_match = re.search(r"(?<!\d)([1-8])(?!\d)", waku_text)
+                waku = int(waku_match.group(1)) if waku_match else 0
 
-                # 現在の出馬表の馬行から脚質を最優先で取得。
-                # 「Image先中13週」のようなimg属性内の脚質も対象にする。
-                style = extract_style_from_row(row)
-                style_source = (
-                    "出馬表・脚質欄"
-                    if style != "不明"
-                    else "未取得"
+                # 騎手
+                jockey_elem = row.find(
+                    "td", class_=re.compile(r"Jockey", re.I)
+                )
+                jockey = (
+                    jockey_elem.get_text(" ", strip=True)
+                    if jockey_elem else ""
                 )
 
-                # 第2段階: 過去走ページの標準構造から取得。
-                if style == "不明" and past_soup is not None:
-                    past_style = extract_style_from_past_page(
-                        past_soup,
-                        uma,
-                        horse_name,
+                # 斤量
+                kinryo = 55.0
+                for td in row.find_all("td"):
+                    txt = td.get_text(" ", strip=True)
+                    km = re.search(r"(?<!\d)(\d{2}\.\d)(?!\d)", txt)
+                    if km:
+                        val = float(km.group(1))
+                        if 45.0 <= val <= 65.0:
+                            kinryo = val
+                            break
+
+                # 脚質
+                style_elem = row.find(
+                    ["td", "span"],
+                    class_=re.compile(
+                        r"Kyakushitsu|Style|RunningStyle", re.I
                     )
-
-                    if past_style != "不明":
-                        style = past_style
-                        style_source = "過去走"
-
-                # 第2.5段階: 過去走HTMLの直接解析
-                if style == "不明" and past_soup is not None:
-                    robust_style = extract_style_from_past_html_robust(
-                        str(past_soup), uma, horse_name
-                    )
-                    if robust_style != "不明":
-                        style = robust_style
-                        style_source = "過去走・脚質表記"
-
-                # 第3段階: class名やHTML構造が変わっていても、
-                # 馬名/馬番を手掛かりに過去走テキストを広く探索。
-                if style == "不明" and past_soup is not None:
-                    inferred_style = (
-                        extract_style_from_any_past_horse_text(
-                            past_soup,
-                            uma,
-                            horse_name,
-                        )
-                    )
-
-                    if inferred_style != "不明":
-                        style = inferred_style
-                        style_source = "過去走・通過順位推定"
-
-                if style == "不明":
-                    detail_style = extract_style_from_horse_detail(session, row, horse_name)
-                    if detail_style != "不明":
-                        style = detail_style
-                        style_source = "馬詳細・過去成績"
-
-                style_display = {
-                    "逃": "逃げ",
-                    "先": "先行",
-                    "差": "差し",
-                    "追": "追込",
-                }.get(style, "不明")
-
-                previous_jockey = extract_last_jockey_from_past_page(
-                    past_soup, uma, horse_name
                 )
+                kyakushitsu = (
+                    style_elem.get_text(" ", strip=True)
+                    if style_elem else "不明"
+                )
+                if not kyakushitsu:
+                    kyakushitsu = "不明"
+
+                # オッズ
+                odds = None
+                odds_elem = row.find(
+                    "td", class_=re.compile(r"Odds", re.I)
+                )
+                if odds_elem:
+                    odds = parse_odds(
+                        odds_elem.get_text(" ", strip=True)
+                    )
 
                 candidate = {
-                    "枠番": int(waku),
-                    "馬番": int(uma),
+                    "枠番": waku,
+                    "馬番": uma,
                     "馬名": horse_name,
                     "騎手": jockey,
-                    "調教師": trainer,
-                    "前走騎手": previous_jockey,
                     "斤量": kinryo,
-                    "脚質": style,
-                    "脚質表示": style_display,
-                    "脚質取得元": style_source,
+                    "脚質": kyakushitsu,
                     "オッズ": odds,
                 }
 
-                # 重複した馬番があった場合、
-                # 情報量の多い行を優先する。
-                quality = 0
-
-                if candidate["騎手"]:
-                    quality += 3
-                if candidate["斤量"] is not None:
-                    quality += 2
-                if candidate["脚質"] != "不明":
-                    quality += 2
-                if candidate["オッズ"] is not None:
-                    quality += 2
-                if candidate["枠番"] > 0:
-                    quality += 1
-
-                old = horse_map.get(uma)
-
-                if old is None or quality > old["_quality"]:
-                    candidate["_quality"] = quality
-                    horse_map[uma] = candidate
+                # 同じ馬番が複数取れた場合は情報量の多い方を採用
+                old = horses_by_number.get(uma)
+                if old is None:
+                    horses_by_number[uma] = candidate
+                else:
+                    old_score = sum([
+                        bool(old.get("馬名")),
+                        bool(old.get("騎手")),
+                        old.get("斤量") != 55.0,
+                        old.get("脚質") != "不明",
+                        old.get("オッズ") is not None,
+                    ])
+                    new_score = sum([
+                        bool(candidate.get("馬名")),
+                        bool(candidate.get("騎手")),
+                        candidate.get("斤量") != 55.0,
+                        candidate.get("脚質") != "不明",
+                        candidate.get("オッズ") is not None,
+                    ])
+                    if new_score > old_score:
+                        horses_by_number[uma] = candidate
 
             except Exception:
                 continue
 
-        horses = []
+        horses = [
+            horses_by_number[n]
+            for n in sorted(horses_by_number)
+        ]
 
-        for uma in sorted(horse_map.keys()):
-            item = horse_map[uma].copy()
-            item.pop("_quality", None)
-
-            # Noneを内部データとして許容するが、
-            # 画面表示時には必ず「-」にする。
-            horses.append(item)
-
-        if not horses:
+        # 3頭だけ等の部分取得を正常データとして扱わない
+        if len(horses) <= 3:
             return None, (
-                "出走馬データの抽出件数が0件です。"
+                "出走馬データの取得が不完全です。"
+                f"現在{len(horses)}頭しか取得できませんでした。"
+                "ページ構造または取得元を確認してください。"
             )
 
-        # ----------------------------------------------------
-        # 脚質統計
-        # ----------------------------------------------------
         kyaku_count = sum(
-            1
-            for h in horses
-            if h.get("脚質") in {"逃", "先", "差", "追"}
+            1 for h in horses
+            if h.get("脚質") not in (None, "", "不明")
         )
 
         front_runner_count = sum(
-            1
-            for h in horses
-            if h.get("脚質") in {"逃", "先"}
+            1 for h in horses
+            if (
+                "逃" in str(h.get("脚質", ""))
+                or "先" in str(h.get("脚質", ""))
+            )
         )
 
-        # ----------------------------------------------------
-        # オッズ統計
-        # ----------------------------------------------------
         valid_odds_count = sum(
             1
             for h in horses
