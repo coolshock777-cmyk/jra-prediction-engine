@@ -1,4 +1,4 @@
-JRA Prediction Engine Ver.2.48
+JRA Prediction Engine Ver.2.49
 
 今回の変更
 - 結果確定時に予測履歴と関連する買い目履歴を相互反映。回収額・収支・メモ・確定状態の不整合を防止。
@@ -6,6 +6,7 @@ JRA Prediction Engine Ver.2.48
 - 同日レースは結果掲載までは予想可能状態を維持。
 - Google Cloudのサービスアカウント鍵を使わず、Google Apps Script Web App経由でGoogle DriveへCSV同期。
 - 買い目履歴と予測履歴のローカル保存は維持。
+- 予想実行時に予測履歴を保存し、成績ダッシュボードへログを残す仕様を維持。
 - 同じレースでも別の予測ログなら別買い目として保存する既存仕様を維持。
 - CSVはUTF-8 BOM付きで保存し、Excelで日本語が文字化けしにくい形式を維持。
 - 長いIDはアプリ内部では生文字列として保持。
