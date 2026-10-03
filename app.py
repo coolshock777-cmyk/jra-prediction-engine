@@ -7,6 +7,7 @@ import json
 import numpy as np
 import os
 import hashlib
+import io
 from datetime import datetime
 
 # ================================================================
@@ -191,7 +192,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.43"
+VERSION = "Ver.2.44"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -308,6 +309,17 @@ if not check_password():
 # 3. CSV管理
 # ============================================================
 
+def _force_text_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
+    """CSV再読込時にメモ等へ文字列を安全に代入できる型へ統一する。"""
+    df = df.copy()
+    for col in columns:
+        if col in df.columns:
+            # object型にしてから欠損を空文字へ。pandas 2.x の LossySetitemError を防止。
+            df[col] = df[col].astype("object")
+            df[col] = df[col].where(df[col].notna(), "")
+    return df
+
+
 def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -315,24 +327,25 @@ def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
         "出走頭数", "軸馬オッズ", "回収額",
         "収支", "投資額", "オッズ取得率",
     ]
+    text_cols = [
+        "予測ログID", "レースID", "レース名", "開催日", "予想日時",
+        "データ取得日時", "コース", "距離", "馬場状態", "勝負度",
+        "軸馬", "相手馬", "バイアス履歴", "モデルバージョン",
+        "確定フラグ", "メモ", "オッズ状態",
+    ]
 
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce",
-            ).fillna(0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    return df
+    return _force_text_columns(df, text_cols)
 
 
 def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     for col in CSV_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-
     df = df[CSV_COLUMNS]
     return sanitize_df_types(df)
 
@@ -340,37 +353,31 @@ def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_history_df():
     if os.path.exists(CSV_FILENAME):
         try:
-            df = pd.read_csv(
-                CSV_FILENAME,
-                encoding="utf-8-sig",
-            )
+            df = pd.read_csv(CSV_FILENAME, encoding="utf-8-sig", low_memory=False)
             df = normalize_history_columns(df)
             st.session_state["history_df"] = df
             return df
         except Exception as e:
-            st.warning(
-                f"履歴CSVの読み込みに失敗しました。"
-                f"新しい履歴として扱います: {e}"
-            )
+            st.warning(f"履歴CSVの読み込みに失敗しました。新しい履歴として扱います: {e}")
 
     if "history_df" not in st.session_state:
-        st.session_state["history_df"] = pd.DataFrame(
-            columns=CSV_COLUMNS
-        )
-
+        st.session_state["history_df"] = pd.DataFrame(columns=CSV_COLUMNS)
     return st.session_state["history_df"]
+
+
+def _write_csv_atomic(df: pd.DataFrame, filename: str):
+    """CSVを一時ファイル経由で保存し、途中失敗で既存ファイルを壊さない。"""
+    tmp = filename + ".tmp"
+    df.to_csv(tmp, index=False, encoding="utf-8-sig")
+    os.replace(tmp, filename)
 
 
 def save_history_df(df: pd.DataFrame):
     df = normalize_history_columns(df)
     st.session_state["history_df"] = df
-
     try:
-        df.to_csv(
-            CSV_FILENAME,
-            index=False,
-            encoding="utf-8-sig",
-        )
+        _write_csv_atomic(df, CSV_FILENAME)
+        sync_csv_to_google_drive(CSV_FILENAME)
         return True
     except Exception as e:
         st.error(f"ファイル保存エラー: {str(e)}")
@@ -382,16 +389,24 @@ def normalize_bet_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in BET_CSV_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    return df[BET_CSV_COLUMNS]
+    df = df[BET_CSV_COLUMNS]
+
+    numeric_cols = [
+        "特注穴馬ポイント", "危険人気馬モデル評価シェア",
+        "買い目総額", "回収額", "収支",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    text_cols = [c for c in BET_CSV_COLUMNS if c not in numeric_cols]
+    return _force_text_columns(df, text_cols)
 
 
 def load_bet_history_df():
     if os.path.exists(BET_CSV_FILENAME):
         try:
-            df = pd.read_csv(
-                BET_CSV_FILENAME,
-                encoding="utf-8-sig",
-            )
+            df = pd.read_csv(BET_CSV_FILENAME, encoding="utf-8-sig", low_memory=False)
             df = normalize_bet_columns(df)
             st.session_state["bet_history_df"] = df
             return df
@@ -399,9 +414,7 @@ def load_bet_history_df():
             st.warning(f"買い目履歴CSVの読み込みに失敗しました: {e}")
 
     if "bet_history_df" not in st.session_state:
-        st.session_state["bet_history_df"] = pd.DataFrame(
-            columns=BET_CSV_COLUMNS
-        )
+        st.session_state["bet_history_df"] = pd.DataFrame(columns=BET_CSV_COLUMNS)
     return st.session_state["bet_history_df"]
 
 
@@ -409,14 +422,78 @@ def save_bet_history_df(df: pd.DataFrame):
     df = normalize_bet_columns(df)
     st.session_state["bet_history_df"] = df
     try:
-        df.to_csv(
-            BET_CSV_FILENAME,
-            index=False,
-            encoding="utf-8-sig",
-        )
+        _write_csv_atomic(df, BET_CSV_FILENAME)
+        sync_csv_to_google_drive(BET_CSV_FILENAME)
         return True
     except Exception as e:
         st.error(f"買い目履歴保存エラー: {str(e)}")
+        return False
+
+
+def _google_drive_configured():
+    try:
+        return bool(
+            st.secrets.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+            and st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")
+        )
+    except Exception:
+        return False
+
+
+def sync_csv_to_google_drive(filename: str):
+    """設定されている場合のみGoogle Drive上の同名CSVを更新する。
+    未設定なら従来どおりローカルCSV保存だけで動作する。
+    """
+    if not _google_drive_configured():
+        return False
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+
+        raw = st.secrets["GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON"]
+        if isinstance(raw, str):
+            info = json.loads(raw)
+        else:
+            info = dict(raw)
+        folder_id = str(st.secrets["GOOGLE_DRIVE_FOLDER_ID"])
+
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        query = (
+            f"'{folder_id}' in parents and "
+            f"name = '{filename}' and trashed = false"
+        )
+        result = service.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=10,
+        ).execute()
+        matches = result.get("files", [])
+
+        with open(filename, "rb") as fh:
+            media = MediaIoBaseUpload(fh, mimetype="text/csv", resumable=False)
+            if matches:
+                service.files().update(
+                    fileId=matches[0]["id"],
+                    media_body=media,
+                ).execute()
+            else:
+                service.files().create(
+                    body={"name": filename, "parents": [folder_id]},
+                    media_body=media,
+                    fields="id,name",
+                ).execute()
+        return True
+    except Exception as e:
+        # Drive同期失敗で予想・ログのローカル保存まで失敗させない。
+        st.warning(f"Google Drive同期は未完了です（ローカルCSVは保存済み）: {e}")
         return False
 
 
@@ -3966,11 +4043,14 @@ elif mode == "📊 成績ダッシュボード・結果入力":
                 ].index
                 if not idx.empty:
                     i = idx[0]
-                    amount = float(bet_df.loc[i, "買い目総額"])
+                    # Ver.2.44: 結果確定前に文字列列を再正規化し、
+                    # pandas 2.x の LossySetitemError を防止。
+                    bet_df = normalize_bet_columns(bet_df)
+                    amount = float(pd.to_numeric(bet_df.loc[i, "買い目総額"], errors="coerce") or 0)
                     bet_df.loc[i, "結果"] = "確定"
-                    bet_df.loc[i, "回収額"] = ret
-                    bet_df.loc[i, "収支"] = ret - amount
-                    bet_df.loc[i, "メモ"] = memo
+                    bet_df.loc[i, "回収額"] = float(ret)
+                    bet_df.loc[i, "収支"] = float(ret) - amount
+                    bet_df.loc[i, "メモ"] = str(memo or "")
 
                     if save_bet_history_df(bet_df):
                         st.success("✅ 買い目結果を確定しました。")
