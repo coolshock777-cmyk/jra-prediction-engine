@@ -192,7 +192,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.47"
+VERSION = "Ver.2.48"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -446,6 +446,58 @@ def load_bet_history_df():
     if "bet_history_df" not in st.session_state:
         st.session_state["bet_history_df"] = pd.DataFrame(columns=BET_CSV_COLUMNS)
     return st.session_state["bet_history_df"]
+
+
+def _sync_result_to_related_bet(prediction_log_id, result_value, return_amount, profit, memo):
+    """予測履歴の結果確定時に、同じ予測ログの買い目履歴も同期する。"""
+    try:
+        bet_df = load_bet_history_df()
+        if bet_df.empty:
+            return False
+
+        mask = bet_df["予測ログID"].astype(str) == str(prediction_log_id)
+        if not mask.any():
+            return False
+
+        bet_df = normalize_bet_columns(bet_df)
+        for idx in bet_df.index[mask]:
+            bet_df.loc[idx, "結果"] = str(result_value)
+            bet_df.loc[idx, "回収額"] = float(return_amount)
+            bet_df.loc[idx, "収支"] = float(profit)
+            bet_df.loc[idx, "メモ"] = str(memo or "")
+
+        return save_bet_history_df(bet_df)
+    except Exception as e:
+        st.warning(f"買い目履歴への結果反映に失敗しました（予測履歴は保存済み）: {e}")
+        return False
+
+
+def _sync_result_to_related_prediction(bet_row, result_value, return_amount, profit, memo):
+    """買い目履歴の結果確定時に、同じ予測ログの予測履歴も同期する。"""
+    try:
+        prediction_log_id = str(bet_row.get("予測ログID", ""))
+        if not prediction_log_id:
+            return False
+
+        history_df = load_history_df()
+        if history_df.empty:
+            return False
+
+        mask = history_df["予測ログID"].astype(str) == prediction_log_id
+        if not mask.any():
+            return False
+
+        history_df = normalize_history_columns(history_df)
+        for idx in history_df.index[mask]:
+            history_df.loc[idx, "確定フラグ"] = "確定"
+            history_df.loc[idx, "回収額"] = float(return_amount)
+            history_df.loc[idx, "収支"] = float(profit)
+            history_df.loc[idx, "メモ"] = str(memo or "")
+
+        return save_history_df(history_df)
+    except Exception as e:
+        st.warning(f"予測履歴への結果反映に失敗しました（買い目履歴は保存済み）: {e}")
+        return False
 
 
 def save_bet_history_df(df: pd.DataFrame):
@@ -1830,6 +1882,62 @@ REQUEST_HEADERS = {
 }
 
 
+def detect_race_status(session, race_id: str, race_date=None):
+    """レース終了状態を安全側で判定する。
+
+    1) netkeibaの結果ページで着順・払戻等の結果表示を確認
+    2) 結果ページで判定できない場合、開催日が今日より前なら終了扱い
+    3) 同日で結果未掲載なら「未確定」とする
+    """
+    try:
+        result_url = (
+            "https://race.netkeiba.com/race/"
+            f"result.html?race_id={race_id}"
+        )
+        response = session.get(
+            result_url,
+            headers={**REQUEST_HEADERS, "Referer": "https://race.netkeiba.com/"},
+            timeout=10,
+        )
+        if response.ok:
+            response.encoding = (
+                response.apparent_encoding
+                or response.encoding
+                or "euc-jp"
+            )
+            result_soup = BeautifulSoup(response.text, "html.parser")
+            text = normalize_text(result_soup.get_text(" ", strip=True))
+
+            # 結果ページに実着順が掲載されている場合だけ終了とする。
+            rank_nodes = result_soup.select(
+                ".Result_Num, .Result_Table .Rank, .Race_Result .Result_Num"
+            )
+            has_rank = len(rank_nodes) >= 3
+            has_result_words = (
+                ("着順" in text and ("払戻" in text or "タイム" in text))
+                or "レース結果" in text
+            )
+            if has_rank and has_result_words:
+                return "終了", "結果ページで着順を確認"
+
+            # CSS構造が変わった場合の文字ベースフォールバック。
+            if "着順" in text and "払戻" in text:
+                return "終了", "結果ページで着順・払戻を確認"
+    except Exception:
+        pass
+
+    try:
+        if race_date is not None:
+            race_day = pd.Timestamp(race_date).date()
+            today = pd.Timestamp.now().date()
+            if race_day < today:
+                return "終了", "開催日が経過"
+    except Exception:
+        pass
+
+    return "未確定", "結果未掲載"
+
+
 @st.cache_data(
     ttl=30,
     show_spinner=False,
@@ -1914,6 +2022,8 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
             "front_runner_count": 0,
             "odds_coverage": 0.0,
             "odds_status": "未取得（発売前等）",
+            "race_status": "未確定",
+            "race_status_reason": "結果未掲載",
             "fetched_at": datetime.now(),
         }
 
@@ -1958,6 +2068,17 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     y, m, d = map(int, dm.groups())
                     extracted["race_date"] = datetime(y, m, d)
                     break
+
+        # ----------------------------------------------------
+        # レース終了状態
+        # ----------------------------------------------------
+        race_status, race_status_reason = detect_race_status(
+            session,
+            race_id,
+            extracted.get("race_date"),
+        )
+        extracted["race_status"] = race_status
+        extracted["race_status_reason"] = race_status_reason
 
         # ----------------------------------------------------
         # レース名
@@ -3071,6 +3192,17 @@ if mode == "🏇 リアルタイム予想":
             fetched_info["odds_status"],
         )
 
+        if fetched_info.get("race_status") == "終了":
+            st.error(
+                "⛔ このレースは終了済みのため、新しいモデル予想は実行できません。"
+                f"（判定根拠: {fetched_info.get('race_status_reason', '結果確認')}）"
+            )
+        else:
+            st.info(
+                "🟢 このレースは予想可能状態です。"
+                "結果掲載後は自動的に予想不可へ切り替わります。"
+            )
+
         with st.expander("🔎 脚質・オッズ取得診断"):
             diag_df = pd.DataFrame(fetched_info["horses"])
 
@@ -3291,10 +3423,15 @@ if mode == "🏇 リアルタイム予想":
         step=100,
     )
 
-    run_disabled = fetched_info is None
+    run_disabled = (
+        fetched_info is None
+        or fetched_info.get("race_status") == "終了"
+    )
 
-    if run_disabled:
+    if fetched_info is None:
         st.info("まず出走表を取得してください。")
+    elif fetched_info.get("race_status") == "終了":
+        st.info("終了済みレースではモデル予想ボタンは無効です。")
 
     if st.button(
         "🚀 モデル予想を実行",
@@ -4035,8 +4172,15 @@ elif mode == "📊 成績ダッシュボード・結果入力":
                     df.loc[idx, "メモ"] = input_memo
 
                     if save_history_df(df):
+                        _sync_result_to_related_bet(
+                            target_log_id,
+                            "確定",
+                            input_return,
+                            input_return - investment,
+                            input_memo,
+                        )
                         st.success(
-                            "✅ 確定成績を保存しました。"
+                            "✅ 確定成績を保存しました。予測履歴と関連する買い目履歴にも結果を反映しました。"
                         )
                         st.rerun()
 
@@ -4122,7 +4266,14 @@ elif mode == "📊 成績ダッシュボード・結果入力":
                     bet_df.loc[i, "メモ"] = str(memo or "")
 
                     if save_bet_history_df(bet_df):
-                        st.success("✅ 買い目結果を確定しました。")
+                        _sync_result_to_related_prediction(
+                            row,
+                            "確定",
+                            ret,
+                            float(ret) - amount,
+                            memo,
+                        )
+                        st.success("✅ 買い目結果を確定しました。予測履歴にも結果を反映しました。")
                         st.rerun()
 
 
