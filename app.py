@@ -192,7 +192,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.44"
+VERSION = "Ver.2.46"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -365,10 +365,40 @@ def load_history_df():
     return st.session_state["history_df"]
 
 
+def _excel_safe_csv_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Excelで直接開いたときの文字コード・長いIDの自動変換を防ぐための出力用整形。
+
+    アプリ内部のDataFrameは変更せず、CSV出力時だけ識別子をExcelの文字列
+    として扱わせる。これにより 202605040101... のような長いIDが
+    2.03E+11 等の指数表記になったり末尾が丸められたりするのを防ぐ。
+    """
+    out = df.copy()
+    id_cols = [
+        "予測ログID", "レースID", "買い目保存ID",
+    ]
+    for col in id_cols:
+        if col in out.columns:
+            out[col] = out[col].fillna("").astype(str).map(
+                lambda x: f'=\"{x.replace(chr(34), chr(34) * 2)}\"' if x else ""
+            )
+    return out
+
+
+def _csv_bytes_for_download(df: pd.DataFrame) -> bytes:
+    """Excel向けUTF-8 BOM付きCSVをbytesで生成する。
+
+    to_csv() の戻り値はstrなので、encoding='utf-8-sig'を指定するだけでは
+    BOMが付かない。ここで明示的にUTF-8-SIGへエンコードする。
+    """
+    text = _excel_safe_csv_df(df).to_csv(index=False, lineterminator="\r\n")
+    return text.encode("utf-8-sig")
+
+
 def _write_csv_atomic(df: pd.DataFrame, filename: str):
     """CSVを一時ファイル経由で保存し、途中失敗で既存ファイルを壊さない。"""
     tmp = filename + ".tmp"
-    df.to_csv(tmp, index=False, encoding="utf-8-sig")
+    # ローカル保存はアプリが再読込する生データ。UTF-8 BOMのみ付け、IDは生文字列で保持する。
+    df.to_csv(tmp, index=False, encoding="utf-8-sig", lineterminator="\r\n")
     os.replace(tmp, filename)
 
 
@@ -430,21 +460,61 @@ def save_bet_history_df(df: pd.DataFrame):
         return False
 
 
+def _get_google_drive_secret(name: str, default=""):
+    """Streamlit secrets からDrive設定を安全に取得する。"""
+    try:
+        value = st.secrets.get(name, default)
+        if value is None:
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def _parse_service_account_info(raw):
+    """サービスアカウントJSONを文字列/辞書のどちらからでも復元する。"""
+    if isinstance(raw, dict):
+        info = dict(raw)
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        info = json.loads(text)
+
+    # TOML/貼り付け時に private_key の改行が文字列\nになるケースを吸収する。
+    if isinstance(info.get("private_key"), str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    return info
+
+
 def _google_drive_configured():
     try:
-        return bool(
-            st.secrets.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
-            and st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")
-        )
+        raw = _get_google_drive_secret("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+        folder_id = str(_get_google_drive_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+        return bool(raw and folder_id)
     except Exception:
         return False
 
 
+def _set_drive_sync_status(filename: str, ok: bool, message: str = ""):
+    status = st.session_state.setdefault("drive_sync_status", {})
+    status[filename] = {
+        "ok": bool(ok),
+        "message": str(message or ""),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def sync_csv_to_google_drive(filename: str):
-    """設定されている場合のみGoogle Drive上の同名CSVを更新する。
-    未設定なら従来どおりローカルCSV保存だけで動作する。
+    """ローカルCSVをGoogle Driveの指定フォルダへ確実に同期する。
+
+    - 設定未投入ならDrive同期を行わず False を返す。
+    - 既存同名ファイルがあれば更新、なければ新規作成。
+    - Shared Drive/共有フォルダでも動くよう supportsAllDrives を付ける。
+    - 同期結果を session_state に残し、画面側で成否を表示できるようにする。
     """
     if not _google_drive_configured():
+        _set_drive_sync_status(filename, False, "Google Drive設定がありません")
         return False
 
     try:
@@ -452,12 +522,15 @@ def sync_csv_to_google_drive(filename: str):
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
 
-        raw = st.secrets["GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON"]
-        if isinstance(raw, str):
-            info = json.loads(raw)
-        else:
-            info = dict(raw)
-        folder_id = str(st.secrets["GOOGLE_DRIVE_FOLDER_ID"])
+        raw = _get_google_drive_secret("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+        info = _parse_service_account_info(raw)
+        folder_id = str(_get_google_drive_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+        shared_drive_id = str(_get_google_drive_secret("GOOGLE_DRIVE_SHARED_DRIVE_ID", "")).strip()
+
+        if not info.get("client_email") or not info.get("private_key"):
+            raise ValueError("サービスアカウントJSONに client_email / private_key がありません")
+        if not folder_id:
+            raise ValueError("GOOGLE_DRIVE_FOLDER_ID が未設定です")
 
         creds = service_account.Credentials.from_service_account_info(
             info,
@@ -465,35 +538,62 @@ def sync_csv_to_google_drive(filename: str):
         )
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+        # ファイル名にシングルクォートが含まれてもDrive検索が壊れないようにする。
+        safe_name = str(filename).replace("'", "\\'")
         query = (
             f"'{folder_id}' in parents and "
-            f"name = '{filename}' and trashed = false"
+            f"name = '{safe_name}' and trashed = false"
         )
-        result = service.files().list(
-            q=query,
-            spaces="drive",
-            fields="files(id,name)",
-            pageSize=10,
-        ).execute()
+
+        list_kwargs = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "files(id,name,parents,modifiedTime),nextPageToken",
+            "pageSize": 100,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+        if shared_drive_id:
+            list_kwargs.update({
+                "corpora": "drive",
+                "driveId": shared_drive_id,
+            })
+
+        result = service.files().list(**list_kwargs).execute()
         matches = result.get("files", [])
 
         with open(filename, "rb") as fh:
-            media = MediaIoBaseUpload(fh, mimetype="text/csv", resumable=False)
+            media = MediaIoBaseUpload(
+                fh,
+                mimetype="text/csv; charset=utf-8",
+                resumable=False,
+            )
             if matches:
+                # 同名ファイルが複数ある場合も最初の1件だけを更新し、
+                # 新しい重複ファイルを増やさない。
                 service.files().update(
                     fileId=matches[0]["id"],
                     media_body=media,
+                    supportsAllDrives=True,
                 ).execute()
             else:
+                body = {"name": filename, "parents": [folder_id]}
                 service.files().create(
-                    body={"name": filename, "parents": [folder_id]},
+                    body=body,
                     media_body=media,
-                    fields="id,name",
+                    fields="id,name,parents,modifiedTime",
+                    supportsAllDrives=True,
                 ).execute()
+
+        msg = f"Google Driveへ同期しました: {filename}"
+        _set_drive_sync_status(filename, True, msg)
         return True
+
     except Exception as e:
-        # Drive同期失敗で予想・ログのローカル保存まで失敗させない。
-        st.warning(f"Google Drive同期は未完了です（ローカルCSVは保存済み）: {e}")
+        msg = f"Google Drive同期エラー: {type(e).__name__}: {e}"
+        _set_drive_sync_status(filename, False, msg)
+        # Drive側の失敗でローカルCSVまで消さない。
+        st.warning(f"⚠️ {msg}（ローカルCSVは保存済み）")
         return False
 
 
@@ -2857,6 +2957,10 @@ def build_display_horse_df(horses):
 
 st.sidebar.title("🏇 JRA AI予想 engine")
 st.sidebar.caption(f"モデル: **{VERSION}**")
+if _google_drive_configured():
+    st.sidebar.success("Google Drive: 設定済み")
+else:
+    st.sidebar.info("Google Drive: 未設定")
 
 mode = st.sidebar.radio(
     "機能メニュー",
@@ -3786,9 +3890,21 @@ if mode == "🏇 リアルタイム予想":
                 if save_bet_history_df(updated_bets):
                     latest["bet_saved"] = True
                     st.session_state["latest_prediction"] = latest
-                    st.success(
-                        "✅ 買い目を JRA_Bet_History.csv に保存しました。"
-                    )
+                    drive_status = st.session_state.get("drive_sync_status", {})
+                    bet_drive = drive_status.get(BET_CSV_FILENAME, {})
+                    if _google_drive_configured() and not bet_drive.get("ok", False):
+                        st.error(
+                            "❌ 買い目はローカルCSVには保存されましたが、Google Drive同期に失敗しました。"
+                            "画面の警告に表示された原因を確認してください。"
+                        )
+                    elif _google_drive_configured():
+                        st.success(
+                            "✅ 買い目を保存し、JRA_Bet_History.csv をGoogle Driveへ同期しました。"
+                        )
+                    else:
+                        st.success(
+                            "✅ 買い目を JRA_Bet_History.csv に保存しました。"
+                        )
                     st.rerun()
 
 
@@ -3996,10 +4112,7 @@ elif mode == "📊 成績ダッシュボード・結果入力":
 
         st.download_button(
             label="📥 買い目履歴CSVをダウンロード",
-            data=bet_df.to_csv(
-                index=False,
-                encoding="utf-8-sig",
-            ),
+            data=_csv_bytes_for_download(bet_df),
             file_name=BET_CSV_FILENAME,
             mime="text/csv",
             use_container_width=True,
@@ -4065,10 +4178,7 @@ elif mode == "📊 成績ダッシュボード・結果入力":
 
     st.download_button(
         label="📥 CSVをダウンロード",
-        data=df.to_csv(
-            index=False,
-            encoding="utf-8-sig",
-        ),
+        data=_csv_bytes_for_download(df),
         file_name=CSV_FILENAME,
         mime="text/csv",
         use_container_width=True,
