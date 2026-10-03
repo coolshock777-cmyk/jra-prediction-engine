@@ -1,24 +1,28 @@
-JRA Prediction Engine Ver.2.46
+JRA Prediction Engine Ver.2.47
 
-今回の修正は保存・Google Drive同期まわりのみ。予想・脚質・騎手・調教師ロジックは変更していません。
+今回の変更
+- Google Cloudのサービスアカウント鍵を使わず、Google Apps Script Web App経由でGoogle DriveへCSV同期。
+- 買い目履歴と予測履歴のローカル保存は維持。
+- 同じレースでも別の予測ログなら別買い目として保存する既存仕様を維持。
+- CSVはUTF-8 BOM付きで保存し、Excelで日本語が文字化けしにくい形式を維持。
+- 長いIDはアプリ内部では生文字列として保持。
 
-修正内容
-- JRA_Bet_History.csv の「メモ」等の文字列列を明示的に文字列型へ統一
-- pandas 2.x の LossySetitemError を防止
-- 買い目結果確定前にも型を再正規化
-- CSVを一時ファイル経由で安全に保存
-- JRA_Prediction_History.csv と JRA_Bet_History.csv の保存処理を共通化
-- Google Drive API設定がある場合は同名CSVをDriveフォルダへ更新/新規作成
-- 共有フォルダ/Shared Driveでも同期できるよう supportsAllDrives に対応
-- サービスアカウントJSONの文字列/辞書形式、private_key の改行表現に対応
-- Drive同期結果を画面状態へ記録し、保存成功とDrive同期成功を区別
-- Drive同期が失敗してもローカルCSV保存は成功扱いにしてログ消失を防止
-- 同一レースでも予測ログIDが異なる再予想は別買い目として保存（レースIDだけで重複排除しない）
+初回設定
+1. google_drive_webapp.gs をGoogle Apps Scriptへコピー。
+2. FOLDER_ID を保存先Google DriveフォルダIDに変更。
+3. WEBAPP_TOKEN を任意の長い秘密文字列に変更。
+4. ウェブアプリとしてデプロイ。
+   - 実行ユーザー: 自分
+   - アクセスできるユーザー: 全員
+5. 発行された /exec URL と同じWEBAPP_TOKENをStreamlit Secretsへ設定。
 
-Google Drive同期設定（Streamlit secrets）
-GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = サービスアカウントJSON全体
-GOOGLE_DRIVE_FOLDER_ID = CSVを保存するGoogle DriveフォルダID
-GOOGLE_DRIVE_SHARED_DRIVE_ID = （任意）Shared Driveを使う場合のDrive ID
+Streamlit Secrets:
+APP_PASSWORD = "現在のパスワード"
+GOOGLE_DRIVE_WEBAPP_URL = "発行された/exec URL"
+GOOGLE_DRIVE_WEBAPP_TOKEN = "Apps Scriptと同じトークン"
 
-サービスアカウントには対象フォルダへの編集権限を付与してください。Shared Driveを使う場合は、そのShared Drive側でも適切な権限を付与してください。
-設定がない場合は従来どおりローカルCSVのみ保存します。
+重要
+- サービスアカウントJSON、private_key、Google Cloudの鍵は不要。
+- google_drive_webapp.gs のURLやトークンは公開しない。
+- Apps Scriptを「実行ユーザー: 自分」でデプロイすることで、保存先DriveはそのGoogleアカウントの権限で操作される。
+- アクセス設定を「全員」にするため、認証はWEBAPP_TOKENで行う。トークンは十分長くランダムなものを使用する。
