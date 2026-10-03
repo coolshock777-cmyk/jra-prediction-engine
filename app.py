@@ -241,6 +241,7 @@ CSV_COLUMNS = [
     "勝負度", "軸馬", "相手馬", "軸馬オッズ", "バイアス履歴",
     "モデルバージョン", "確定フラグ", "回収額", "収支", "メモ",
     "投資額", "オッズ状態", "オッズ取得率",
+    "結果着順", "結果払戻", "結果取得日時",
 ]
 
 BET_CSV_COLUMNS = [
@@ -264,6 +265,7 @@ DEFAULT_SESSION_VALUES = {
     "fetched_info": None,
     "latest_prediction": None,
     "latest_bet": None,
+    "race_result": None,
 }
 
 for key, value in DEFAULT_SESSION_VALUES.items():
@@ -332,6 +334,7 @@ def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
         "データ取得日時", "コース", "距離", "馬場状態", "勝負度",
         "軸馬", "相手馬", "バイアス履歴", "モデルバージョン",
         "確定フラグ", "メモ", "オッズ状態",
+        "結果着順", "結果払戻", "結果取得日時",
     ]
 
     for col in numeric_cols:
@@ -1883,12 +1886,29 @@ REQUEST_HEADERS = {
 
 
 def detect_race_status(session, race_id: str, race_date=None):
-    """レース終了状態を安全側で判定する。
+    """レース状態を日付優先＋結果ページ厳格判定で判定する。
 
-    1) netkeibaの結果ページで着順・払戻等の結果表示を確認
-    2) 結果ページで判定できない場合、開催日が今日より前なら終了扱い
-    3) 同日で結果未掲載なら「未確定」とする
+    重要:
+    - 開催日が未来なら、結果ページに「レース結果」等の共通文言が
+      含まれていても絶対に終了扱いにしない。
+    - 当日は #All_Result_Table に実着順が存在した場合のみ終了。
+    - 過去日は終了扱い。ただし結果ページの取得に失敗していても
+      「開催日が経過」という根拠を返す。
     """
+    try:
+        if race_date is not None:
+            race_day = pd.Timestamp(race_date).date()
+            today_jst = pd.Timestamp.now(tz="Asia/Tokyo").date()
+
+            if race_day > today_jst:
+                return "未確定", "開催日前（未来日）"
+
+            if race_day < today_jst:
+                return "終了", "開催日が経過"
+    except Exception:
+        pass
+
+    # 同日だけ結果ページを確認する。
     try:
         result_url = (
             "https://race.netkeiba.com/race/"
@@ -1896,7 +1916,10 @@ def detect_race_status(session, race_id: str, race_date=None):
         )
         response = session.get(
             result_url,
-            headers={**REQUEST_HEADERS, "Referer": "https://race.netkeiba.com/"},
+            headers={
+                **REQUEST_HEADERS,
+                "Referer": "https://race.netkeiba.com/",
+            },
             timeout=10,
         )
         if response.ok:
@@ -1905,37 +1928,193 @@ def detect_race_status(session, race_id: str, race_date=None):
                 or response.encoding
                 or "euc-jp"
             )
-            result_soup = BeautifulSoup(response.text, "html.parser")
-            text = normalize_text(result_soup.get_text(" ", strip=True))
-
-            # 結果ページに実着順が掲載されている場合だけ終了とする。
-            rank_nodes = result_soup.select(
-                ".Result_Num, .Result_Table .Rank, .Race_Result .Result_Num"
+            result_soup = BeautifulSoup(
+                response.text,
+                "html.parser",
             )
-            has_rank = len(rank_nodes) >= 3
-            has_result_words = (
-                ("着順" in text and ("払戻" in text or "タイム" in text))
-                or "レース結果" in text
-            )
-            if has_rank and has_result_words:
-                return "終了", "結果ページで着順を確認"
 
-            # CSS構造が変わった場合の文字ベースフォールバック。
-            if "着順" in text and "払戻" in text:
-                return "終了", "結果ページで着順・払戻を確認"
+            # 共通ページ文言ではなく「全着順」テーブルを根拠にする。
+            result_table = result_soup.select_one("#All_Result_Table")
+            result_rows = (
+                result_table.select("tbody tr.HorseList")
+                if result_table is not None
+                else []
+            )
+
+            valid_rank_count = 0
+            for row in result_rows:
+                rank_node = row.select_one(
+                    ".Result_Num .Rank, .Result_Num"
+                )
+                if rank_node is None:
+                    continue
+                rank_text = normalize_text(
+                    rank_node.get_text(" ", strip=True)
+                )
+                if re.fullmatch(r"\d+", rank_text):
+                    valid_rank_count += 1
+
+            if valid_rank_count >= 3:
+                return "終了", "結果ページの全着順テーブルを確認"
+
     except Exception:
         pass
+
+    return "未確定", "結果未掲載（同日）"
+
+
+def fetch_race_result(session, race_id: str):
+    """netkeiba結果ページから着順と払戻情報を取得する。
+
+    結果判定とは分離し、UIから明示的に結果取得したときに呼び出す。
+    """
+    result_url = (
+        "https://race.netkeiba.com/race/"
+        f"result.html?race_id={race_id}"
+    )
 
     try:
-        if race_date is not None:
-            race_day = pd.Timestamp(race_date).date()
-            today = pd.Timestamp.now().date()
-            if race_day < today:
-                return "終了", "開催日が経過"
-    except Exception:
-        pass
+        response = session.get(
+            result_url,
+            headers={
+                **REQUEST_HEADERS,
+                "Referer": "https://race.netkeiba.com/",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        response.encoding = (
+            response.apparent_encoding
+            or response.encoding
+            or "euc-jp"
+        )
+        soup = BeautifulSoup(response.text, "html.parser")
 
-    return "未確定", "結果未掲載"
+        result_table = soup.select_one("#All_Result_Table")
+        if result_table is None:
+            return None, "結果テーブル（#All_Result_Table）が見つかりません。"
+
+        rows = []
+        for row in result_table.select("tbody tr.HorseList"):
+            rank_node = row.select_one(
+                ".Result_Num .Rank, .Result_Num"
+            )
+            nums = row.select("td.Num")
+            horse_node = row.select_one(".Horse_Name")
+            time_nodes = row.select("td.Time")
+
+            rank = normalize_text(
+                rank_node.get_text(" ", strip=True)
+                if rank_node is not None else ""
+            )
+            if not re.fullmatch(r"\d+", rank):
+                continue
+
+            frame_no = (
+                normalize_text(nums[0].get_text(" ", strip=True))
+                if len(nums) >= 1 else ""
+            )
+            horse_no = (
+                normalize_text(nums[1].get_text(" ", strip=True))
+                if len(nums) >= 2 else ""
+            )
+            horse_name = normalize_text(
+                horse_node.get_text(" ", strip=True)
+                if horse_node is not None else ""
+            )
+            race_time = (
+                normalize_text(time_nodes[0].get_text(" ", strip=True))
+                if len(time_nodes) >= 1 else ""
+            )
+            margin = (
+                normalize_text(time_nodes[1].get_text(" ", strip=True))
+                if len(time_nodes) >= 2 else ""
+            )
+
+            rows.append({
+                "着順": rank,
+                "枠番": frame_no,
+                "馬番": horse_no,
+                "馬名": horse_name,
+                "タイム": race_time,
+                "着差": margin,
+            })
+
+        if len(rows) < 3:
+            return None, "結果ページに確定した着順がまだ掲載されていません。"
+
+        # 払戻は「払戻金」を含むテーブルから行単位で保存。
+        payout_rows = []
+        for table in soup.find_all("table"):
+            table_text = normalize_text(
+                table.get_text(" ", strip=True)
+            )
+            if "単勝" not in table_text or "円" not in table_text:
+                continue
+
+            for tr in table.find_all("tr"):
+                cells = [
+                    normalize_text(
+                        cell.get_text(" ", strip=True)
+                    )
+                    for cell in tr.find_all(["th", "td"])
+                ]
+                cells = [x for x in cells if x]
+                if cells and any("円" in x for x in cells):
+                    payout_rows.append(cells)
+
+        # 同じ行の重複を除去。
+        unique_payouts = []
+        seen_payouts = set()
+        for row in payout_rows:
+            key = tuple(row)
+            if key not in seen_payouts:
+                seen_payouts.add(key)
+                unique_payouts.append(row)
+
+        top3_text = " / ".join(
+            f"{r['着順']}着 {r['馬番']}番 {r['馬名']}"
+            for r in rows[:3]
+        )
+
+        return {
+            "race_id": str(race_id),
+            "result_url": result_url,
+            "rows": rows,
+            "payout_rows": unique_payouts,
+            "top3_text": top3_text,
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }, None
+
+    except Exception as e:
+        return None, f"結果取得エラー: {e}"
+
+
+def apply_race_result_to_history(race_id: str, result: dict):
+    """結果だけを予測履歴へ反映する。成績の確定フラグは変更しない。"""
+    df = load_history_df()
+    if df.empty or "レースID" not in df.columns:
+        return 0, "予測履歴に対象レースがありません。"
+
+    df = normalize_history_columns(df)
+    mask = df["レースID"].astype(str) == str(race_id)
+
+    if not mask.any():
+        return 0, "予測履歴に対象レースのログがありません。"
+
+    result_text = result.get("top3_text", "")
+    payout_text = " / ".join(
+        " ".join(row) for row in result.get("payout_rows", [])
+    )
+
+    for idx in df.index[mask]:
+        df.loc[idx, "結果着順"] = str(result_text)
+        df.loc[idx, "結果払戻"] = str(payout_text)
+        df.loc[idx, "結果取得日時"] = str(result.get("fetched_at", ""))
+
+    if save_history_df(df):
+        return int(mask.sum()), "結果情報を予測履歴へ反映しました。"
+    return 0, "予測履歴の保存に失敗しました。"
 
 
 @st.cache_data(
@@ -3144,6 +3323,7 @@ if mode == "🏇 リアルタイム予想":
         else:
             st.session_state["fetched_info"] = info
             st.session_state["latest_prediction"] = None
+            st.session_state["race_result"] = None
             st.rerun()
 
     fetched_info = st.session_state.get(
@@ -3197,6 +3377,71 @@ if mode == "🏇 リアルタイム予想":
                 "⛔ このレースは終了済みのため、新しいモデル予想は実行できません。"
                 f"（判定根拠: {fetched_info.get('race_status_reason', '結果確認')}）"
             )
+
+            if st.button(
+                "🏁 結果・着順・払戻を取得",
+                key="fetch_race_result",
+                use_container_width=True,
+            ):
+                with st.spinner("レース結果を取得中..."):
+                    result_session = requests.Session()
+                    result_session.headers.update(REQUEST_HEADERS)
+                    result, result_error = fetch_race_result(
+                        result_session,
+                        str(fetched_info["race_id"]),
+                    )
+
+                if result_error:
+                    st.warning(f"⚠️ {result_error}")
+                else:
+                    st.session_state["race_result"] = result
+                    st.rerun()
+
+            race_result = st.session_state.get("race_result")
+            if race_result:
+                st.markdown("### 🏁 レース結果")
+                st.success(
+                    f"🥇 {race_result['top3_text']}"
+                )
+
+                result_df = pd.DataFrame(
+                    race_result["rows"]
+                )
+                st.dataframe(
+                    result_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                if race_result.get("payout_rows"):
+                    st.markdown("#### 💰 払戻")
+                    payout_df = pd.DataFrame(
+                        race_result["payout_rows"]
+                    )
+                    st.dataframe(
+                        payout_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                if st.button(
+                    "💾 結果情報を予測履歴へ反映",
+                    key="apply_race_result",
+                    use_container_width=True,
+                ):
+                    count, message = apply_race_result_to_history(
+                        str(fetched_info["race_id"]),
+                        race_result,
+                    )
+                    if count > 0:
+                        st.success(
+                            f"✅ {count}件の予測履歴へ結果を反映しました。"
+                            "（成績の確定フラグは変更していません）"
+                        )
+                        st.rerun()
+                    else:
+                        st.info(message)
+
         else:
             st.info(
                 "🟢 このレースは予想可能状態です。"
