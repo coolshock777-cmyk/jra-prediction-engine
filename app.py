@@ -235,6 +235,10 @@ ALL_DISTANCES_WITH_OTHER = ALL_DISTANCES + ["その他"]
 CSV_FILENAME = "JRA_Prediction_History.csv"
 BET_CSV_FILENAME = "JRA_Bet_History.csv"
 
+# Ver.2.49: 実戦ログの集計開始日。既存のテストログはCSVに残すが、
+# 成績ダッシュボードの集計・表示対象からはこの日より前を除外する。
+LIVE_LOG_START_DATE = "2026-10-04"
+
 CSV_COLUMNS = [
     "予測ログID", "レースID", "レース名", "開催日", "予想日時",
     "データ取得日時", "コース", "距離", "馬場状態", "出走頭数",
@@ -3865,54 +3869,6 @@ if mode == "🏇 リアルタイム予想":
             "bet_saved": False,
         }
 
-        # Ver.2.49 成績ログ修正:
-        # 予想を実行した時点で予測履歴を保存する。
-        # 買い目履歴は従来どおり「この買い目を保存」ボタンでのみ保存する。
-        # 2.48で正常だった出走馬取得・予想処理には手を加えない。
-        history_df = load_history_df()
-        history_exists = (
-            not history_df.empty
-            and (
-                history_df["予測ログID"].astype(str)
-                == str(prediction_log_id)
-            ).any()
-        )
-
-        if not history_exists:
-            history_record = {
-                "予測ログID": prediction_log_id,
-                "レースID": fetched_info["race_id"],
-                "レース名": fetched_info["race_name"],
-                "開催日": fetched_info["race_date"].strftime("%Y-%m-%d"),
-                "予想日時": prediction_time,
-                "データ取得日時": fetched_info["fetched_at"].strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "コース": f"{fetched_info['venue']}{track_type}",
-                "距離": final_distance,
-                "馬場状態": condition,
-                "出走頭数": len(horses),
-                "勝負度": confidence,
-                "軸馬": top_horse,
-                "相手馬": partner_horses,
-                "軸馬オッズ": top_odds_value,
-                "バイアス履歴": bias_text,
-                "モデルバージョン": VERSION,
-                "確定フラグ": "未確定",
-                "回収額": 0,
-                "収支": 0,
-                "メモ": "",
-                "投資額": bet_info["total_amount"],
-                "オッズ状態": fetched_info["odds_status"],
-                "オッズ取得率": fetched_info["odds_coverage"],
-            }
-            save_history_df(
-                pd.concat(
-                    [history_df, pd.DataFrame([history_record])],
-                    ignore_index=True,
-                )
-            )
-
         st.success("予想計算が完了しました。")
 
     latest = st.session_state.get(
@@ -4320,309 +4276,180 @@ if mode == "🏇 リアルタイム予想":
 elif mode == "📊 成績ダッシュボード・結果入力":
 
     st.header("📊 成績ダッシュボード")
+    st.caption(
+        f"実戦ログ開始日: **{LIVE_LOG_START_DATE.replace('-', '/')}** "
+        "（開始日前のテストログはデータとして残しますが、成績集計には含めません）"
+    )
 
-    df = load_history_df()
-
-    if df.empty:
+    # 全履歴はそのまま保持し、ダッシュボードだけ実戦開始日以降に絞る。
+    all_history_df = load_history_df()
+    if all_history_df.empty:
         st.info("まだ予測履歴がありません。")
         st.stop()
 
-    df = sanitize_df_types(df)
+    all_history_df = sanitize_df_types(all_history_df)
+    history_dates = pd.to_datetime(all_history_df["開催日"], errors="coerce")
+    live_start_ts = pd.Timestamp(LIVE_LOG_START_DATE)
+    df = all_history_df.loc[history_dates >= live_start_ts].copy()
 
-    confirmed_df = df[
-        df["確定フラグ"] == "確定"
-    ].copy()
-
-    total_logs = len(df)
-    confirmed_logs = len(confirmed_df)
-
-    total_investment = (
-        confirmed_df["投資額"].astype(float).sum()
-        if not confirmed_df.empty
-        else 0
-    )
-
-    total_return = (
-        confirmed_df["回収額"].astype(float).sum()
-        if not confirmed_df.empty
-        else 0
-    )
-
-    total_balance = (
-        total_return - total_investment
-    )
-
-    recovery_rate = (
-        total_return / total_investment * 100
-        if total_investment > 0
-        else 0
-    )
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric(
-        "予測ログ数",
-        f"{total_logs:,}",
-    )
-
-    m2.metric(
-        "確定ログ数",
-        f"{confirmed_logs:,}",
-    )
-
-    m3.metric(
-        "回収率",
-        f"{recovery_rate:.1f}%",
-    )
-
-    m4.metric(
-        "累計収支",
-        f"{int(total_balance):+,}円",
-    )
-
-    st.markdown("### 📡 オッズ状態別ログ")
-
-    odds_summary = (
-        df.groupby("オッズ状態")
-        .size()
-        .reset_index(name="件数")
-    )
-
-    st.dataframe(
-        odds_summary,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("---")
-    st.subheader("📝 未確定ログの結果入力")
-
-    unconfirmed_df = df[
-        df["確定フラグ"] == "未確定"
-    ].copy()
-
-    if unconfirmed_df.empty:
-
-        st.info("現在、未確定ログはありません。")
-
+    if df.empty:
+        st.info(f"{LIVE_LOG_START_DATE.replace('-', '/')}以降の実戦ログはまだありません。")
     else:
+        df = sanitize_df_types(df)
+        confirmed_df = df[df["確定フラグ"] == "確定"].copy()
+        total_logs = len(df)
+        confirmed_logs = len(confirmed_df)
+        total_investment = confirmed_df["投資額"].astype(float).sum() if not confirmed_df.empty else 0
+        total_return = confirmed_df["回収額"].astype(float).sum() if not confirmed_df.empty else 0
+        total_balance = total_return - total_investment
+        recovery_rate = total_return / total_investment * 100 if total_investment > 0 else 0
 
-        with st.form("result_update_form"):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("実戦予測ログ数", f"{total_logs:,}")
+        m2.metric("確定ログ数", f"{confirmed_logs:,}")
+        m3.metric("回収率", f"{recovery_rate:.1f}%")
+        m4.metric("累計収支", f"{int(total_balance):+,}円")
 
-            options = []
+        st.markdown("### 📡 オッズ状態別ログ")
+        odds_summary = df.groupby("オッズ状態").size().reset_index(name="件数")
+        st.dataframe(odds_summary, use_container_width=True, hide_index=True)
 
-            for _, row in unconfirmed_df.iterrows():
-                options.append(
-                    f"{row['予測ログID']} | "
-                    f"{row['開催日']} | "
-                    f"{row['レース名']} | "
-                    f"{row['予想日時']} | "
-                    f"{row['オッズ状態']}"
+        st.markdown("---")
+        st.subheader("📝 未確定ログの結果入力")
+        unconfirmed_df = df[df["確定フラグ"] == "未確定"].copy()
+
+        if unconfirmed_df.empty:
+            st.info("現在、未確定ログはありません。")
+        else:
+            with st.form("result_update_form"):
+                options = []
+                for _, row in unconfirmed_df.iterrows():
+                    options.append(
+                        f"{row['予測ログID']} | {row['開催日']} | {row['レース名']} | "
+                        f"{row['予想日時']} | {row['オッズ状態']}"
+                    )
+                selected_option = st.selectbox("結果を入力する予測ログ", options)
+                selected_position = options.index(selected_option)
+                selected_row = unconfirmed_df.iloc[selected_position]
+
+                st.caption(
+                    f"レース: **{selected_row['レース名']}** | "
+                    f"軸: **{selected_row['軸馬']}** | 投資: **{selected_row['投資額']}円**"
                 )
+                input_return = st.number_input("回収額 / 払戻金", min_value=0, value=0, step=100)
+                input_memo = st.text_input("メモ", value="")
+                submit = st.form_submit_button("確定成績を保存")
 
-            selected_option = st.selectbox(
-                "結果を入力する予測ログ",
-                options,
-            )
-
-            selected_position = options.index(
-                selected_option
-            )
-
-            selected_row = unconfirmed_df.iloc[
-                selected_position
-            ]
-
-            st.caption(
-                f"レース: **{selected_row['レース名']}** "
-                f"| 軸: **{selected_row['軸馬']}** "
-                f"| 投資: **{selected_row['投資額']}円**"
-            )
-
-            input_return = st.number_input(
-                "回収額 / 払戻金",
-                min_value=0,
-                value=0,
-                step=100,
-            )
-
-            input_memo = st.text_input(
-                "メモ",
-                value="",
-            )
-
-            submit = st.form_submit_button(
-                "確定成績を保存"
-            )
-
-            if submit:
-
-                target_log_id = selected_row[
-                    "予測ログID"
-                ]
-
-                match_idx = df[
-                    df["予測ログID"].astype(str)
-                    == str(target_log_id)
-                ].index
-
-                if match_idx.empty:
-                    st.error("対象ログが見つかりません。")
-                else:
-                    idx = match_idx[0]
-
-                    investment = float(
-                        df.loc[idx, "投資額"]
-                    )
-
-                    df.loc[idx, "確定フラグ"] = "確定"
-                    df.loc[idx, "回収額"] = input_return
-                    df.loc[idx, "収支"] = (
-                        input_return - investment
-                    )
-                    df.loc[idx, "メモ"] = input_memo
-
-                    if save_history_df(df):
-                        _sync_result_to_related_bet(
-                            target_log_id,
-                            "確定",
-                            input_return,
-                            input_return - investment,
-                            input_memo,
-                        )
-                        st.success(
-                            "✅ 確定成績を保存しました。予測履歴と関連する買い目履歴にも結果を反映しました。"
-                        )
-                        st.rerun()
+                if submit:
+                    target_log_id = selected_row["予測ログID"]
+                    match_idx = all_history_df[all_history_df["予測ログID"].astype(str) == str(target_log_id)].index
+                    if match_idx.empty:
+                        st.error("対象ログが見つかりません。")
+                    else:
+                        idx = match_idx[0]
+                        investment = float(all_history_df.loc[idx, "投資額"])
+                        all_history_df.loc[idx, "確定フラグ"] = "確定"
+                        all_history_df.loc[idx, "回収額"] = input_return
+                        all_history_df.loc[idx, "収支"] = input_return - investment
+                        all_history_df.loc[idx, "メモ"] = input_memo
+                        if save_history_df(all_history_df):
+                            _sync_result_to_related_bet(target_log_id, "確定", input_return, input_return - investment, input_memo)
+                            st.success("✅ 確定成績を保存しました。予測履歴と関連する買い目履歴にも結果を反映しました。")
+                            st.rerun()
 
     st.markdown("---")
     st.subheader("🎫 保存済み買い目履歴")
 
-    bet_df = load_bet_history_df()
+    # 買い目もCSV全体は保持し、ダッシュボード表示・集計だけ実戦開始日以降に絞る。
+    all_bet_df = load_bet_history_df()
 
-    if bet_df.empty:
+    if all_bet_df.empty:
         st.info("保存済みの買い目はまだありません。")
     else:
-        bet_amount = pd.to_numeric(
-            bet_df["買い目総額"], errors="coerce"
-        ).fillna(0).sum()
-        bet_return = pd.to_numeric(
-            bet_df["回収額"], errors="coerce"
-        ).fillna(0).sum()
+        all_bet_df = normalize_bet_columns(all_bet_df)
+        bet_dates = pd.to_datetime(all_bet_df["開催日"], errors="coerce")
+        bet_df = all_bet_df.loc[bet_dates >= live_start_ts].copy()
 
-        bc1, bc2, bc3 = st.columns(3)
-        bc1.metric("保存買い目件数", f"{len(bet_df):,}")
-        bc2.metric("買い目総額", f"{int(bet_amount):,}円")
-        bc3.metric("買い目収支", f"{int(bet_return - bet_amount):+,}円")
-
-        show_archived = st.checkbox(
-            "📦 CSVダウンロード済みの買い目も表示",
-            value=bool(st.session_state.get("show_archived_bets", False)),
-            key="show_archived_bets_checkbox",
-        )
-        st.session_state["show_archived_bets"] = show_archived
-
-        active_bets = bet_df[bet_df["CSVダウンロード済み"] != "済"].copy()
-        archived_bets = bet_df[bet_df["CSVダウンロード済み"] == "済"].copy()
-        display_bets = bet_df.copy() if show_archived else active_bets
-
-        st.caption(
-            f"通常表示 {len(active_bets):,}件 / アーカイブ済み {len(archived_bets):,}件 "
-            "（CSVダウンロード後も履歴データは削除されません）"
-        )
-
-        if display_bets.empty:
-            st.info("通常表示する未処理の買い目はありません。上のチェックを入れるとアーカイブ済みも表示できます。")
+        if bet_df.empty:
+            st.info(f"{LIVE_LOG_START_DATE.replace('-', '/')}以降の実戦買い目はまだありません。")
         else:
-            st.dataframe(
-                display_bets,
-                use_container_width=True,
-                hide_index=True,
+            bet_amount = pd.to_numeric(bet_df["買い目総額"], errors="coerce").fillna(0).sum()
+            bet_return = pd.to_numeric(bet_df["回収額"], errors="coerce").fillna(0).sum()
+            bc1, bc2, bc3 = st.columns(3)
+            bc1.metric("保存買い目件数", f"{len(bet_df):,}")
+            bc2.metric("買い目総額", f"{int(bet_amount):,}円")
+            bc3.metric("買い目収支", f"{int(bet_return - bet_amount):+,}円")
+
+            show_archived = st.checkbox(
+                "📦 CSVダウンロード済みの買い目も表示",
+                value=bool(st.session_state.get("show_archived_bets", False)),
+                key="show_archived_bets_checkbox",
+            )
+            st.session_state["show_archived_bets"] = show_archived
+            active_bets = bet_df[bet_df["CSVダウンロード済み"] != "済"].copy()
+            archived_bets = bet_df[bet_df["CSVダウンロード済み"] == "済"].copy()
+            display_bets = bet_df.copy() if show_archived else active_bets
+
+            st.caption(
+                f"通常表示 {len(active_bets):,}件 / アーカイブ済み {len(archived_bets):,}件 "
+                "（CSVダウンロード後も履歴データは削除されません）"
             )
 
-        if not active_bets.empty:
-            active_ids = active_bets["買い目保存ID"].astype(str).tolist()
-            st.download_button(
-                label="📥 未処理の買い目をCSVダウンロード",
-                data=_csv_bytes_for_download(active_bets),
-                file_name=BET_CSV_FILENAME,
-                mime="text/csv",
-                use_container_width=True,
-                on_click=archive_bets_after_download,
-                args=(active_ids,),
-            )
-        else:
-            st.info("未処理の買い目はありません。")
+            if display_bets.empty:
+                st.info("通常表示する未処理の買い目はありません。上のチェックを入れるとアーカイブ済みも表示できます。")
+            else:
+                st.dataframe(display_bets, use_container_width=True, hide_index=True)
 
-        pending = bet_df[bet_df["結果"] != "確定"].copy()
-        if not pending.empty:
-            st.markdown("### 📝 保存済み買い目の結果入力")
-            options = [
-                f"{r['買い目保存ID']} | {r['開催日']} | {r['レース名']}"
-                for _, r in pending.iterrows()
-            ]
-            selected = st.selectbox(
-                "結果を入力する買い目",
-                options,
-                key="bet_result_select",
-            )
-            pos = options.index(selected)
-            row = pending.iloc[pos]
+            if not active_bets.empty:
+                active_ids = active_bets["買い目保存ID"].astype(str).tolist()
+                st.download_button(
+                    label="📥 未処理の買い目をCSVダウンロード",
+                    data=_csv_bytes_for_download(active_bets),
+                    file_name=BET_CSV_FILENAME,
+                    mime="text/csv",
+                    use_container_width=True,
+                    on_click=archive_bets_after_download,
+                    args=(active_ids,),
+                )
+            else:
+                st.info("未処理の買い目はありません。")
 
-            ret = st.number_input(
-                "買い目の実回収額",
-                min_value=0,
-                value=0,
-                step=100,
-                key="bet_return_input",
-            )
-            memo = st.text_input(
-                "買い目メモ",
-                value="",
-                key="bet_memo_input",
-            )
+            pending = bet_df[bet_df["結果"] != "確定"].copy()
+            if not pending.empty:
+                st.markdown("### 📝 保存済み買い目の結果入力")
+                options = [
+                    f"{r['買い目保存ID']} | {r['開催日']} | {r['レース名']}"
+                    for _, r in pending.iterrows()
+                ]
+                selected = st.selectbox("結果を入力する買い目", options, key="bet_result_select")
+                pos = options.index(selected)
+                row = pending.iloc[pos]
 
-            if st.button(
-                "💾 買い目結果を確定",
-                key="confirm_bet_result",
-            ):
-                idx = bet_df[
-                    bet_df["買い目保存ID"].astype(str)
-                    == str(row["買い目保存ID"])
-                ].index
-                if not idx.empty:
-                    i = idx[0]
-                    # Ver.2.44: 結果確定前に文字列列を再正規化し、
-                    # pandas 2.x の LossySetitemError を防止。
-                    bet_df = normalize_bet_columns(bet_df)
-                    amount = float(pd.to_numeric(bet_df.loc[i, "買い目総額"], errors="coerce") or 0)
-                    bet_df.loc[i, "結果"] = "確定"
-                    bet_df.loc[i, "回収額"] = float(ret)
-                    bet_df.loc[i, "収支"] = float(ret) - amount
-                    bet_df.loc[i, "メモ"] = str(memo or "")
+                ret = st.number_input("買い目の実回収額", min_value=0, value=0, step=100, key="bet_return_input")
+                memo = st.text_input("買い目メモ", value="", key="bet_memo_input")
 
-                    if save_bet_history_df(bet_df):
-                        _sync_result_to_related_prediction(
-                            row,
-                            "確定",
-                            ret,
-                            float(ret) - amount,
-                            memo,
-                        )
-                        st.success("✅ 買い目結果を確定しました。予測履歴にも結果を反映しました。")
-                        st.rerun()
+                if st.button("💾 買い目結果を確定", key="confirm_bet_result"):
+                    idx = all_bet_df[all_bet_df["買い目保存ID"].astype(str) == str(row["買い目保存ID"])].index
+                    if not idx.empty:
+                        i = idx[0]
+                        all_bet_df = normalize_bet_columns(all_bet_df)
+                        amount = float(pd.to_numeric(all_bet_df.loc[i, "買い目総額"], errors="coerce") or 0)
+                        all_bet_df.loc[i, "結果"] = "確定"
+                        all_bet_df.loc[i, "回収額"] = float(ret)
+                        all_bet_df.loc[i, "収支"] = float(ret) - amount
+                        all_bet_df.loc[i, "メモ"] = str(memo or "")
+                        if save_bet_history_df(all_bet_df):
+                            _sync_result_to_related_prediction(row, "確定", ret, float(ret) - amount, memo)
+                            st.success("✅ 買い目結果を確定しました。予測履歴にも結果を反映しました。")
+                            st.rerun()
 
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.download_button(
-        label="📥 CSVをダウンロード",
-        data=_csv_bytes_for_download(df),
-        file_name=CSV_FILENAME,
-        mime="text/csv",
-        use_container_width=True,
-    )
+    # 実戦ログだけを一覧表示。既存テストログはCSVに保持したまま非表示。
+    if not df.empty:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="📥 実戦ログCSVをダウンロード",
+            data=_csv_bytes_for_download(df),
+            file_name=CSV_FILENAME,
+            mime="text/csv",
+            use_container_width=True,
+        )
