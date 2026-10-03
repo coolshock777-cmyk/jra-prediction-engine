@@ -6,11 +6,6 @@ import re
 import json
 import numpy as np
 import os
-
-# Ver.2.49: CSV出力互換ヘルパー
-# 出走馬取得・予想ロジックには触れず、履歴/買い目CSVのExcel文字化け対策だけを担当。
-def export_csv_utf8_bom(df):
-    return df.to_csv(index=False, encoding="utf-8-sig", lineterminator="\r\n")
 import hashlib
 import io
 from datetime import datetime
@@ -257,7 +252,7 @@ BET_CSV_COLUMNS = [
     "危険人気馬判定根拠", "単勝買い目", "馬連買い目", "ワイド買い目",
     "馬単買い目", "三連複買い目", "三連単買い目",
     "コピペ用買い目", "買い目総額", "買い目保存フラグ",
-    "結果", "回収額", "収支", "メモ",
+    "結果", "回収額", "収支", "メモ", "CSVダウンロード済み",
 ]
 
 
@@ -454,6 +449,24 @@ def load_bet_history_df():
     if "bet_history_df" not in st.session_state:
         st.session_state["bet_history_df"] = pd.DataFrame(columns=BET_CSV_COLUMNS)
     return st.session_state["bet_history_df"]
+
+
+def archive_bets_after_download(bet_ids):
+    """ダウンロード済みの買い目を非表示扱いにする（履歴データ自体は削除しない）。"""
+    try:
+        bet_df = load_bet_history_df()
+        if bet_df.empty:
+            return
+        ids = {str(x) for x in (bet_ids or [])}
+        if not ids:
+            return
+        mask = bet_df["買い目保存ID"].astype(str).isin(ids)
+        if mask.any():
+            bet_df = normalize_bet_columns(bet_df)
+            bet_df.loc[mask, "CSVダウンロード済み"] = "済"
+            save_bet_history_df(bet_df)
+    except Exception as e:
+        st.warning(f"ダウンロード済み状態の保存に失敗しました: {e}")
 
 
 def _sync_result_to_related_bet(prediction_log_id, result_value, return_amount, profit, memo):
@@ -4454,19 +4467,44 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         bc2.metric("買い目総額", f"{int(bet_amount):,}円")
         bc3.metric("買い目収支", f"{int(bet_return - bet_amount):+,}円")
 
-        st.dataframe(
-            bet_df,
-            use_container_width=True,
-            hide_index=True,
+        show_archived = st.checkbox(
+            "📦 CSVダウンロード済みの買い目も表示",
+            value=bool(st.session_state.get("show_archived_bets", False)),
+            key="show_archived_bets_checkbox",
+        )
+        st.session_state["show_archived_bets"] = show_archived
+
+        active_bets = bet_df[bet_df["CSVダウンロード済み"] != "済"].copy()
+        archived_bets = bet_df[bet_df["CSVダウンロード済み"] == "済"].copy()
+        display_bets = bet_df.copy() if show_archived else active_bets
+
+        st.caption(
+            f"通常表示 {len(active_bets):,}件 / アーカイブ済み {len(archived_bets):,}件 "
+            "（CSVダウンロード後も履歴データは削除されません）"
         )
 
-        st.download_button(
-            label="📥 買い目履歴CSVをダウンロード",
-            data=_csv_bytes_for_download(bet_df),
-            file_name=BET_CSV_FILENAME,
-            mime="text/csv",
-            use_container_width=True,
-        )
+        if display_bets.empty:
+            st.info("通常表示する未処理の買い目はありません。上のチェックを入れるとアーカイブ済みも表示できます。")
+        else:
+            st.dataframe(
+                display_bets,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if not active_bets.empty:
+            active_ids = active_bets["買い目保存ID"].astype(str).tolist()
+            st.download_button(
+                label="📥 未処理の買い目をCSVダウンロード",
+                data=_csv_bytes_for_download(active_bets),
+                file_name=BET_CSV_FILENAME,
+                mime="text/csv",
+                use_container_width=True,
+                on_click=archive_bets_after_download,
+                args=(active_ids,),
+            )
+        else:
+            st.info("未処理の買い目はありません。")
 
         pending = bet_df[bet_df["結果"] != "確定"].copy()
         if not pending.empty:
