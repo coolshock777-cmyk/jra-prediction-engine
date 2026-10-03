@@ -192,7 +192,7 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.46"
+VERSION = "Ver.2.47"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -461,7 +461,7 @@ def save_bet_history_df(df: pd.DataFrame):
 
 
 def _get_google_drive_secret(name: str, default=""):
-    """Streamlit secrets からDrive設定を安全に取得する。"""
+    """Streamlit secrets からDrive Web App設定を安全に取得する。"""
     try:
         value = st.secrets.get(name, default)
         if value is None:
@@ -471,27 +471,12 @@ def _get_google_drive_secret(name: str, default=""):
         return default
 
 
-def _parse_service_account_info(raw):
-    """サービスアカウントJSONを文字列/辞書のどちらからでも復元する。"""
-    if isinstance(raw, dict):
-        info = dict(raw)
-    else:
-        text = str(raw or "").strip()
-        if not text:
-            return {}
-        info = json.loads(text)
-
-    # TOML/貼り付け時に private_key の改行が文字列\nになるケースを吸収する。
-    if isinstance(info.get("private_key"), str):
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-    return info
-
-
 def _google_drive_configured():
+    """サービスアカウント鍵を使わず、Google Apps Script Web App経由でDriveへ同期する。"""
     try:
-        raw = _get_google_drive_secret("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
-        folder_id = str(_get_google_drive_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
-        return bool(raw and folder_id)
+        url = str(_get_google_drive_secret("GOOGLE_DRIVE_WEBAPP_URL", "")).strip()
+        token = str(_get_google_drive_secret("GOOGLE_DRIVE_WEBAPP_TOKEN", "")).strip()
+        return bool(url and token)
     except Exception:
         return False
 
@@ -506,86 +491,57 @@ def _set_drive_sync_status(filename: str, ok: bool, message: str = ""):
 
 
 def sync_csv_to_google_drive(filename: str):
-    """ローカルCSVをGoogle Driveの指定フォルダへ確実に同期する。
+    """ローカルCSVをGoogle Apps Script Web App経由でGoogle Driveへ同期する。
 
-    - 設定未投入ならDrive同期を行わず False を返す。
-    - 既存同名ファイルがあれば更新、なければ新規作成。
-    - Shared Drive/共有フォルダでも動くよう supportsAllDrives を付ける。
-    - 同期結果を session_state に残し、画面側で成否を表示できるようにする。
+    サービスアカウントJSONやGoogle Cloudの鍵は使用しない。
+    Web App側がユーザーのGoogle Drive権限で同名CSVを更新/新規作成する。
     """
     if not _google_drive_configured():
-        _set_drive_sync_status(filename, False, "Google Drive設定がありません")
+        _set_drive_sync_status(
+            filename,
+            False,
+            "Google Drive Web App設定がありません",
+        )
         return False
 
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseUpload
-
-        raw = _get_google_drive_secret("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
-        info = _parse_service_account_info(raw)
-        folder_id = str(_get_google_drive_secret("GOOGLE_DRIVE_FOLDER_ID", "")).strip()
-        shared_drive_id = str(_get_google_drive_secret("GOOGLE_DRIVE_SHARED_DRIVE_ID", "")).strip()
-
-        if not info.get("client_email") or not info.get("private_key"):
-            raise ValueError("サービスアカウントJSONに client_email / private_key がありません")
-        if not folder_id:
-            raise ValueError("GOOGLE_DRIVE_FOLDER_ID が未設定です")
-
-        creds = service_account.Credentials.from_service_account_info(
-            info,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        service = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-        # ファイル名にシングルクォートが含まれてもDrive検索が壊れないようにする。
-        safe_name = str(filename).replace("'", "\\'")
-        query = (
-            f"'{folder_id}' in parents and "
-            f"name = '{safe_name}' and trashed = false"
-        )
-
-        list_kwargs = {
-            "q": query,
-            "spaces": "drive",
-            "fields": "files(id,name,parents,modifiedTime),nextPageToken",
-            "pageSize": 100,
-            "includeItemsFromAllDrives": True,
-            "supportsAllDrives": True,
-        }
-        if shared_drive_id:
-            list_kwargs.update({
-                "corpora": "drive",
-                "driveId": shared_drive_id,
-            })
-
-        result = service.files().list(**list_kwargs).execute()
-        matches = result.get("files", [])
+        webapp_url = str(
+            _get_google_drive_secret("GOOGLE_DRIVE_WEBAPP_URL", "")
+        ).strip()
+        token = str(
+            _get_google_drive_secret("GOOGLE_DRIVE_WEBAPP_TOKEN", "")
+        ).strip()
 
         with open(filename, "rb") as fh:
-            media = MediaIoBaseUpload(
-                fh,
-                mimetype="text/csv; charset=utf-8",
-                resumable=False,
-            )
-            if matches:
-                # 同名ファイルが複数ある場合も最初の1件だけを更新し、
-                # 新しい重複ファイルを増やさない。
-                service.files().update(
-                    fileId=matches[0]["id"],
-                    media_body=media,
-                    supportsAllDrives=True,
-                ).execute()
-            else:
-                body = {"name": filename, "parents": [folder_id]}
-                service.files().create(
-                    body=body,
-                    media_body=media,
-                    fields="id,name,parents,modifiedTime",
-                    supportsAllDrives=True,
-                ).execute()
+            content_b64 = __import__("base64").b64encode(fh.read()).decode("ascii")
 
-        msg = f"Google Driveへ同期しました: {filename}"
+        payload = {
+            "token": token,
+            "filename": str(filename),
+            "content_base64": content_b64,
+        }
+
+        response = requests.post(
+            webapp_url,
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        try:
+            result = response.json()
+        except Exception:
+            result = {}
+
+        if not result.get("ok"):
+            message = str(
+                result.get("message")
+                or result.get("error")
+                or f"Web Appから正常応答を取得できませんでした（HTTP {response.status_code}）"
+            )
+            raise RuntimeError(message)
+
+        msg = str(result.get("message") or f"Google Driveへ同期しました: {filename}")
         _set_drive_sync_status(filename, True, msg)
         return True
 
