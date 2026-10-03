@@ -3865,6 +3865,54 @@ if mode == "🏇 リアルタイム予想":
             "bet_saved": False,
         }
 
+        # Ver.2.49 成績ログ修正:
+        # 予想を実行した時点で予測履歴を保存する。
+        # 買い目履歴は従来どおり「この買い目を保存」ボタンでのみ保存する。
+        # 2.48で正常だった出走馬取得・予想処理には手を加えない。
+        history_df = load_history_df()
+        history_exists = (
+            not history_df.empty
+            and (
+                history_df["予測ログID"].astype(str)
+                == str(prediction_log_id)
+            ).any()
+        )
+
+        if not history_exists:
+            history_record = {
+                "予測ログID": prediction_log_id,
+                "レースID": fetched_info["race_id"],
+                "レース名": fetched_info["race_name"],
+                "開催日": fetched_info["race_date"].strftime("%Y-%m-%d"),
+                "予想日時": prediction_time,
+                "データ取得日時": fetched_info["fetched_at"].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "コース": f"{fetched_info['venue']}{track_type}",
+                "距離": final_distance,
+                "馬場状態": condition,
+                "出走頭数": len(horses),
+                "勝負度": confidence,
+                "軸馬": top_horse,
+                "相手馬": partner_horses,
+                "軸馬オッズ": top_odds_value,
+                "バイアス履歴": bias_text,
+                "モデルバージョン": VERSION,
+                "確定フラグ": "未確定",
+                "回収額": 0,
+                "収支": 0,
+                "メモ": "",
+                "投資額": bet_info["total_amount"],
+                "オッズ状態": fetched_info["odds_status"],
+                "オッズ取得率": fetched_info["odds_coverage"],
+            }
+            save_history_df(
+                pd.concat(
+                    [history_df, pd.DataFrame([history_record])],
+                    ignore_index=True,
+                )
+            )
+
         st.success("予想計算が完了しました。")
 
     latest = st.session_state.get(
