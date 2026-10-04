@@ -3207,34 +3207,70 @@ def _ticket_text_by_type(rows, bet_type):
 
 
 def _scenario_from_scores(df, hole):
-    """既存のモデル順位・特注穴判定だけを使って5パターンを選ぶ。"""
-    if len(df) < 2:
+    """既存のモデル順位・特注穴判定だけを使って5パターンを選ぶ。
+
+    旧版は「◎のモデル確率シェアが14.5%以上なら①」としていたため、
+    通常のレースで①に偏りやすかった。Ver.2では出走頭数に応じた
+    相対基準と上位馬同士の拮抗度を使い、②〜⑤も実際に選ばれやすくする。
+    """
+    n = len(df)
+    if n < 2:
         return 1
-    p = pd.to_numeric(df["モデル確率(%)"], errors="coerce").fillna(0).to_numpy()
-    top = float(p[0])
-    second = float(p[1])
-    total = max(float(p.sum()), 1.0)
-    top_share = top / total
-    gap = top - second
 
+    p = pd.to_numeric(df["モデル確率(%)"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    if p.sum() <= 0:
+        return 5 if n >= 4 else 1
+
+    p = p / p.sum()
+    top, second = float(p[0]), float(p[1])
+    top2 = float(p[:2].sum())
+    top4 = float(p[:min(4, n)].sum())
+    equal = 1.0 / n
+
+    top_gap_ratio = (top - second) / max(top, 1e-9)
+    top2_ratio = top / max(second, 1e-9)
+
+    # 出走頭数に応じた「堅軸」の基準。
+    # 旧版の固定14.5%より、少頭数/多頭数の差を吸収する。
+    strong_axis = top >= equal * 1.70 and top_gap_ratio >= 0.16
+
+    # ◎と○がかなり近い場合は一騎打ち。
+    close_two = top2_ratio <= 1.16 and top_gap_ratio <= 0.16
+
+    hole_points = 0.0
+    hole_num = None
     if hole is not None:
+        hole_points = float(hole.get("特注穴ポイント", 0) or 0)
         hole_num = int(hole["馬番"])
-        top_num = int(df.iloc[0]["馬番"])
-        # ◎自身が穴ではなく、別馬に強い特注穴があるケース
-        if hole_num != top_num and float(hole["特注穴ポイント"]) >= 38 and top_share >= 0.16:
-            return 3
-        # 特注穴がかなり強く、モデル上位との差が小さいケース
-        if float(hole["特注穴ポイント"]) >= 38 and top_share < 0.16:
-            return 2
 
-    # ◎と○が拮抗しているケース
-    if top_share < 0.145 and abs(gap) <= max(1.5, top * 0.18):
+    top_num = int(df.iloc[0]["馬番"])
+    hole_is_separate = hole_num is not None and hole_num != top_num
+
+    # 特注穴の「強さ」は既存の特注穴ポイントを利用。
+    # 25pt以上で表示対象なので、28pt以上を実戦フォーメーション判定の
+    # 強い穴として扱う。
+    strong_hole = hole_is_separate and hole_points >= 28
+
+    # ③を最優先：堅軸＋強い特注穴。
+    if strong_axis and strong_hole:
+        return 3
+
+    # ②：軸が突出していないが、強い特注穴がいる。
+    if strong_hole and not strong_axis:
+        return 2
+
+    # ④：上位2頭がほぼ互角。
+    if close_two:
         return 4
 
-    # 軸不在：上位4頭が極端に分散
-    if top_share < 0.125:
+    # ⑤：軸不在。上位4頭が比較的均等で、◎が突出していない。
+    # top4が「均等時の1.70倍以内」なら群雄割拠とみなす。
+    top4_equal = min(1.0, 4.0 / n)
+    balanced_top4 = top4 <= top4_equal * 1.70 and top2_ratio <= 1.30
+    if not strong_axis and balanced_top4:
         return 5
 
+    # それ以外は①堅軸。
     return 1
 
 
