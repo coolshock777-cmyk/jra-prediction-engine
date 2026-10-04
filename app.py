@@ -2147,6 +2147,158 @@ def detect_race_status(session, race_id: str, race_date=None):
     return "未確定", "結果未掲載（同日）"
 
 
+def _canonical_payout_key(ticket, bet_type):
+    """払戻表/買い目の組合せを同一形式へ正規化する。"""
+    nums = re.findall(r"\d+", str(ticket))
+    if bet_type in {"複勝", "単勝"}:
+        return str(int(nums[0])) if nums else ""
+    if bet_type in {"馬連", "ワイド", "3連複"}:
+        nums = sorted(nums, key=lambda x: int(x))
+    return "-".join(str(int(x)) for x in nums)
+
+
+def _detect_payout_type(text):
+    text = normalize_text(str(text))
+    if "3連単" in text or "三連単" in text:
+        return "3連単"
+    if "3連複" in text or "三連複" in text:
+        return "3連複"
+    if "馬単" in text:
+        return "馬単"
+    if "馬連" in text:
+        return "馬連"
+    if "ワイド" in text:
+        return "ワイド"
+    if "複勝" in text:
+        return "複勝"
+    if "単勝" in text:
+        return "単勝"
+    return ""
+
+
+def _parse_payout_rows(payout_rows):
+    """netkeibaの払戻行を券種→買い目→100円払戻額へ変換する。\n\n    HTMLの列構造が多少変わっても、券種・馬番組合せ・円表記を\n    手掛かりにできるだけ復元する。"""
+    result = {k: {} for k in ["単勝", "複勝", "馬連", "ワイド", "馬単", "3連複", "3連単"]}
+    for row in payout_rows or []:
+        cells = [normalize_text(str(x)) for x in row if normalize_text(str(x))]
+        if not cells:
+            continue
+        row_text = " ".join(cells)
+        bet_type = _detect_payout_type(row_text)
+        if not bet_type:
+            continue
+
+        # 円付きセルを優先。1,230円 / 1230 円 / 1230円 に対応。
+        amount = None
+        for cell in cells:
+            m = re.search(r"([0-9][0-9,]*)\s*円", cell)
+            if m:
+                amount = int(m.group(1).replace(",", ""))
+                break
+        if amount is None:
+            continue
+
+        # 券種名を除去した後、馬番の組合せ候補を探す。
+        cleaned = re.sub(r"単勝|複勝|馬連|ワイド|馬単|3連複|三連複|3連単|三連単", " ", row_text)
+        cleaned = re.sub(r"[0-9][0-9,]*\s*円", " ", cleaned)
+        # 「1 - 8」「1-8」「1 8」などを候補化。3連系は3個必要。
+        groups = re.findall(r"(?:\d+\s*[-ー−―]\s*\d+(?:\s*[-ー−―]\s*\d+)?|\d+(?:\s+\d+){1,2})", cleaned)
+        if not groups:
+            # 列が個別セルの場合は、金額以外の純数字を組み合わせる。
+            nums = [x for x in re.findall(r"\d+", cleaned) if int(x) <= 18]
+            need = {"単勝":1,"複勝":1,"馬連":2,"ワイド":2,"馬単":2,"3連複":3,"3連単":3}[bet_type]
+            if len(nums) >= need:
+                groups = ["-".join(nums[:need])]
+        for group in groups:
+            key = _canonical_payout_key(group, bet_type)
+            if not key:
+                continue
+            # 同一券種・同一組合せが重複した場合は最初の有効値を保持。
+            result[bet_type].setdefault(key, amount)
+    return result
+
+
+def _parse_saved_bet_lines(text):
+    """保存済み買い目文字列から[(ticket, amount)]を復元する。"""
+    rows = []
+    for line in str(text or "").splitlines():
+        line = normalize_text(line)
+        if not line:
+            continue
+        m = re.search(r"(.+?)\s+([0-9][0-9,]*)\s*円\s*$", line)
+        if not m:
+            continue
+        ticket = m.group(1).strip()
+        try:
+            amount = int(m.group(2).replace(",", ""))
+        except Exception:
+            continue
+        rows.append((ticket, amount))
+    return rows
+
+
+def calculate_bet_return_from_result(bet_row, payout_map):
+    """1件の保存済み買い目について、的中した全買い目の回収額を計算する。"""
+    field_map = {
+        "単勝":"単勝買い目", "複勝":"単勝買い目", # 複勝は下で専用処理
+        "馬連":"馬連買い目", "ワイド":"ワイド買い目", "馬単":"馬単買い目",
+        "3連複":"三連複買い目", "3連単":"三連単買い目",
+    }
+    total = 0
+    hits = []
+    for bet_type in ["単勝", "複勝", "馬連", "ワイド", "馬単", "3連複", "3連単"]:
+        field = field_map[bet_type]
+        text = bet_row.get(field, "")
+        # 複勝は現行CSVに専用列がないため、買い目総額/コピペ用からも拾えるようにする。
+        if bet_type == "複勝":
+            candidates = _parse_saved_bet_lines(bet_row.get("コピペ用買い目", ""))
+            candidates = [(t,a) for t,a in candidates if re.search(r"\b複勝\b", str(t))]
+            candidates = [(re.sub(r"^複勝\s*", "", t),a) for t,a in candidates]
+        else:
+            candidates = _parse_saved_bet_lines(text)
+        for ticket, amount in candidates:
+            key = _canonical_payout_key(ticket, bet_type)
+            payout100 = payout_map.get(bet_type, {}).get(key)
+            if payout100 is None:
+                continue
+            returned = int(round(float(payout100) * amount / 100.0))
+            total += returned
+            hits.append(f"{bet_type} {ticket}: {returned:,}円")
+    return total, hits
+
+
+def reconcile_bet_history_with_result(race_id, result):
+    """保存済み買い目と実際の払戻を全券種・全点照合し、買い目履歴を自動確定する。"""
+    bet_df = load_bet_history_df()
+    if bet_df.empty:
+        return {}, "保存済み買い目なし"
+    payout_map = _parse_payout_rows(result.get("payout_rows", []))
+    mask = bet_df["レースID"].astype(str) == str(race_id)
+    if not mask.any():
+        return {}, "対象レースの保存済み買い目なし"
+
+    summary = {}
+    bet_df = normalize_bet_columns(bet_df)
+    for idx in bet_df.index[mask]:
+        row = bet_df.loc[idx].to_dict()
+        returned, hits = calculate_bet_return_from_result(row, payout_map)
+        investment = float(pd.to_numeric(pd.Series([row.get("買い目総額",0)]), errors="coerce").fillna(0).iloc[0])
+        profit = returned - investment
+        result_label = "的中" if returned > 0 else "不的中"
+        detail = " / ".join(hits) if hits else "的中買い目なし"
+        bet_df.loc[idx, "結果"] = result_label
+        bet_df.loc[idx, "回収額"] = returned
+        bet_df.loc[idx, "収支"] = profit
+        bet_df.loc[idx, "メモ"] = f"払戻自動照合: {detail}"
+        summary[str(row.get("予測ログID", ""))] = {
+            "return": returned, "investment": investment, "profit": profit,
+            "result": result_label, "detail": detail,
+        }
+    if not save_bet_history_df(bet_df):
+        return summary, "買い目履歴の保存に失敗"
+    return summary, "買い目払戻を自動照合しました"
+
+
 def fetch_race_result(session, race_id: str):
     """netkeiba結果ページから着順と払戻情報を取得する。
 
@@ -2275,30 +2427,44 @@ def fetch_race_result(session, race_id: str):
 
 
 def apply_race_result_to_history(race_id: str, result: dict):
-    """結果だけを予測履歴へ反映する。成績の確定フラグは変更しない。"""
+    """結果・払戻を予測履歴へ反映し、保存済み買い目も自動照合する。"""
     df = load_history_df()
     if df.empty or "レースID" not in df.columns:
         return 0, "予測履歴に対象レースがありません。"
 
     df = normalize_history_columns(df)
     mask = df["レースID"].astype(str) == str(race_id)
-
     if not mask.any():
         return 0, "予測履歴に対象レースのログがありません。"
 
     result_text = result.get("top3_text", "")
-    payout_text = " / ".join(
-        " ".join(row) for row in result.get("payout_rows", [])
-    )
-
+    payout_text = " / ".join(" ".join(row) for row in result.get("payout_rows", []))
     for idx in df.index[mask]:
         df.loc[idx, "結果着順"] = str(result_text)
         df.loc[idx, "結果払戻"] = str(payout_text)
         df.loc[idx, "結果取得日時"] = str(result.get("fetched_at", ""))
 
-    if save_history_df(df):
-        return int(mask.sum()), "結果情報を予測履歴へ反映しました。"
-    return 0, "予測履歴の保存に失敗しました。"
+    if not save_history_df(df):
+        return 0, "予測履歴の保存に失敗しました。"
+
+    summary, sync_message = reconcile_bet_history_with_result(race_id, result)
+    # 同じ予測ログの買い目回収額を成績側にも自動反映。複数ログがある場合は各ログ単位。
+    if summary:
+        history_df = load_history_df()
+        for log_id, info in summary.items():
+            if not log_id:
+                continue
+            hmask = history_df["予測ログID"].astype(str) == str(log_id)
+            if hmask.any():
+                for hidx in history_df.index[hmask]:
+                    inv = float(pd.to_numeric(pd.Series([history_df.loc[hidx, "投資額"]]), errors="coerce").fillna(0).iloc[0])
+                    history_df.loc[hidx, "確定フラグ"] = "確定"
+                    history_df.loc[hidx, "回収額"] = float(info["return"])
+                    history_df.loc[hidx, "収支"] = float(info["profit"])
+                    history_df.loc[hidx, "メモ"] = f"払戻自動照合: {info['detail']}"
+        save_history_df(history_df)
+
+    return int(mask.sum()), f"結果情報を反映しました。{sync_message}"
 
 
 @st.cache_data(
@@ -3986,6 +4152,7 @@ if mode == "🏇 リアルタイム予想":
 
                 if race_result.get("payout_rows"):
                     st.markdown("#### 💰 払戻")
+                    st.caption("取得した払戻は、結果反映時に保存済み買い目の全券種・全点と自動照合されます。")
                     payout_df = pd.DataFrame(
                         race_result["payout_rows"]
                     )
@@ -4007,7 +4174,7 @@ if mode == "🏇 リアルタイム予想":
                     if count > 0:
                         st.success(
                             f"✅ {count}件の予測履歴へ結果を反映しました。"
-                            "（成績の確定フラグは変更していません）"
+                            " 保存済み買い目は全券種・全点を実払戻と自動照合し、回収額・収支も更新しました。"
                         )
                         st.rerun()
                     else:
