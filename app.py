@@ -2177,44 +2177,123 @@ def _detect_payout_type(text):
 
 
 def _parse_payout_rows(payout_rows):
-    """netkeibaの払戻行を券種→買い目→100円払戻額へ変換する。\n\n    HTMLの列構造が多少変わっても、券種・馬番組合せ・円表記を\n    手掛かりにできるだけ復元する。"""
-    result = {k: {} for k in ["単勝", "複勝", "馬連", "ワイド", "馬単", "3連複", "3連単"]}
+    """netkeibaの払戻行を券種→買い目→100円払戻額へ変換する。
+
+    netkeibaの払戻テーブルは、特に「ワイド」「複勝」のように
+    1行の中へ複数の組合せ・複数の払戻額をまとめて持つことがある。
+    旧実装では行内の最初の「円」だけを全組合せへ適用していたため、
+    ワイドの2本目・3本目が誤判定される可能性があった。
+
+    Payout_Detail_Table の標準構造
+        [券種, 買い目セル, 払戻セル, 人気セル]
+    を優先して「買い目と払戻額を1対1」で対応させる。
+    """
+    result = {
+        k: {} for k in
+        ["単勝", "複勝", "馬連", "ワイド", "馬単", "3連複", "3連単"]
+    }
+    need_count = {
+        "単勝": 1, "複勝": 1, "馬連": 2, "ワイド": 2,
+        "馬単": 2, "3連複": 3, "3連単": 3,
+    }
+
     for row in payout_rows or []:
         cells = [normalize_text(str(x)) for x in row if normalize_text(str(x))]
         if not cells:
             continue
+
         row_text = " ".join(cells)
         bet_type = _detect_payout_type(row_text)
         if not bet_type:
             continue
 
-        # 円付きセルを優先。1,230円 / 1230 円 / 1230円 に対応。
-        amount = None
-        for cell in cells:
-            m = re.search(r"([0-9][0-9,]*)\s*円", cell)
-            if m:
-                amount = int(m.group(1).replace(",", ""))
-                break
-        if amount is None:
-            continue
+        need = need_count[bet_type]
 
-        # 券種名を除去した後、馬番の組合せ候補を探す。
-        cleaned = re.sub(r"単勝|複勝|馬連|ワイド|馬単|3連複|三連複|3連単|三連単", " ", row_text)
-        cleaned = re.sub(r"[0-9][0-9,]*\s*円", " ", cleaned)
-        # 「1 - 8」「1-8」「1 8」などを候補化。3連系は3個必要。
-        groups = re.findall(r"(?:\d+\s*[-ー−―]\s*\d+(?:\s*[-ー−―]\s*\d+)?|\d+(?:\s+\d+){1,2})", cleaned)
+        # --------------------------------------------------------
+        # ① netkeiba標準の払戻行を優先
+        #    [券種, 組合せ, 払戻額, 人気] の並びを利用する。
+        # --------------------------------------------------------
+        groups = []
+        amounts = []
+
+        if len(cells) >= 3:
+            # 券種名が入ったセルの直後を買い目セルとして扱う。
+            type_index = next(
+                (i for i, c in enumerate(cells) if _detect_payout_type(c) == bet_type),
+                0,
+            )
+            number_cell = cells[type_index + 1] if type_index + 1 < len(cells) else ""
+            amount_cell = cells[type_index + 2] if type_index + 2 < len(cells) else ""
+
+            # 組合せセルから馬番を抽出。
+            nums = [
+                x for x in re.findall(r"\d+", number_cell)
+                if 1 <= int(x) <= 18
+            ]
+
+            # 3連系/ワイド/複勝は複数組合せを同一セルに持つ。
+            if nums and len(nums) % need == 0:
+                groups = [
+                    "-".join(nums[i:i + need])
+                    for i in range(0, len(nums), need)
+                ]
+
+            # 払戻セルから「円」付き金額をすべて取得。
+            amounts = [
+                int(x.replace(",", ""))
+                for x in re.findall(r"([0-9][0-9,]*)\s*円", amount_cell)
+            ]
+
+            # HTMLによっては金額セル内の「円」が省略される/分割される
+            # 場合があるため、amount_cellに円が無ければセル全体から補完。
+            if not amounts:
+                amounts = [
+                    int(x.replace(",", ""))
+                    for x in re.findall(r"[0-9][0-9,]*", amount_cell)
+                ]
+
+        # --------------------------------------------------------
+        # ② 標準構造で取れない場合の汎用フォールバック
+        # --------------------------------------------------------
         if not groups:
-            # 列が個別セルの場合は、金額以外の純数字を組み合わせる。
-            nums = [x for x in re.findall(r"\d+", cleaned) if int(x) <= 18]
-            need = {"単勝":1,"複勝":1,"馬連":2,"ワイド":2,"馬単":2,"3連複":3,"3連単":3}[bet_type]
+            cleaned = re.sub(
+                r"単勝|複勝|馬連|ワイド|馬単|3連複|三連複|3連単|三連単",
+                " ",
+                row_text,
+            )
+            cleaned = re.sub(r"[0-9][0-9,]*\s*円", " ", cleaned)
+            groups = re.findall(
+                r"(?:\d+\s*[-ー−―]\s*\d+"
+                r"(?:\s*[-ー−―]\s*\d+)?|\d+(?:\s+\d+){1,2})",
+                cleaned,
+            )
+
+        if not amounts:
+            for cell in cells:
+                amounts.extend(
+                    int(x.replace(",", ""))
+                    for x in re.findall(r"([0-9][0-9,]*)\s*円", cell)
+                )
+
+        if not groups:
+            nums = [
+                x for x in re.findall(r"\d+", row_text)
+                if 1 <= int(x) <= 18
+            ]
             if len(nums) >= need:
                 groups = ["-".join(nums[:need])]
-        for group in groups:
+
+        if not amounts:
+            continue
+
+        # 組合せと払戻額を1対1で対応。
+        # これによりワイド3本なら3本すべてを別々に保持できる。
+        for group, amount in zip(groups, amounts):
             key = _canonical_payout_key(group, bet_type)
             if not key:
                 continue
-            # 同一券種・同一組合せが重複した場合は最初の有効値を保持。
             result[bet_type].setdefault(key, amount)
+
     return result
 
 
@@ -2379,15 +2458,26 @@ def fetch_race_result(session, race_id: str):
         if len(rows) < 3:
             return None, "結果ページに確定した着順がまだ掲載されていません。"
 
-        # 払戻は「払戻金」を含むテーブルから行単位で保存。
+        # 払戻はPayout_Detail_Tableを最優先で取得。
+        # 旧実装は「単勝」と「円」が同じテーブルにある場合だけ採用していたため、
+        # 2つ目の払戻テーブルに入るワイド・馬単・3連複・3連単が丸ごと欠落する
+        # ケースがあった。
         payout_rows = []
-        for table in soup.find_all("table"):
-            table_text = normalize_text(
-                table.get_text(" ", strip=True)
-            )
-            if "単勝" not in table_text or "円" not in table_text:
-                continue
+        payout_tables = soup.select("table.Payout_Detail_Table")
 
+        # クラス名が変更された場合のフォールバック。
+        if not payout_tables:
+            payout_tables = [
+                table for table in soup.find_all("table")
+                if (
+                    "払戻" in normalize_text(table.get_text(" ", strip=True))
+                    or "単勝" in normalize_text(table.get_text(" ", strip=True))
+                    or "ワイド" in normalize_text(table.get_text(" ", strip=True))
+                )
+                and "円" in normalize_text(table.get_text(" ", strip=True))
+            ]
+
+        for table in payout_tables:
             for tr in table.find_all("tr"):
                 cells = [
                     normalize_text(
@@ -2396,7 +2486,14 @@ def fetch_race_result(session, race_id: str):
                     for cell in tr.find_all(["th", "td"])
                 ]
                 cells = [x for x in cells if x]
-                if cells and any("円" in x for x in cells):
+                if not cells:
+                    continue
+
+                row_text = " ".join(cells)
+                if (
+                    _detect_payout_type(row_text)
+                    and re.search(r"[0-9][0-9,]*\s*円", row_text)
+                ):
                     payout_rows.append(cells)
 
         # 同じ行の重複を除去。
