@@ -1673,6 +1673,110 @@ def parse_odds_api_payload(response_text: str):
     return None
 
 
+def _extract_numeric_odds(value):
+    """netkeibaオッズAPIの値から代表オッズを取り出す。"""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            try:
+                num = float(str(item).replace(",", "").strip())
+                if num > 0:
+                    return num
+            except Exception:
+                continue
+        return None
+    if isinstance(value, dict):
+        for key in ("odds", "odds_low", "odds_min", "value"):
+            if key in value:
+                try:
+                    num = float(str(value[key]).replace(",", "").strip())
+                    if num > 0:
+                        return num
+                except Exception:
+                    pass
+        for item in value.values():
+            num = _extract_numeric_odds(item)
+            if num is not None:
+                return num
+        return None
+    try:
+        num = float(str(value).replace(",", "").strip())
+        return num if num > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_odds_key(key):
+    digits = re.findall(r"\d+", str(key))
+    if not digits:
+        return ""
+    # 01-02 / 0102 / 1-2 のいずれも 0102 に統一
+    if len(digits) > 1:
+        return "".join(f"{int(x):02d}" for x in digits)
+    raw = digits[0]
+    if len(raw) % 2 == 0 and len(raw) >= 4:
+        return "".join(raw[i:i+2] for i in range(0, len(raw), 2))
+    return f"{int(raw):02d}"
+
+
+def _ticket_key(ticket, bet_type):
+    nums = re.findall(r"\d+", str(ticket))
+    if bet_type in {"馬連", "ワイド", "3連複"}:
+        nums = sorted(nums, key=lambda x: int(x))
+    return "".join(f"{int(x):02d}" for x in nums)
+
+
+def fetch_combination_odds_api(race_id: str):
+    """馬連・ワイド・馬単・3連複・3連単の実オッズをnetkeiba APIから取得する。
+
+    type=4/5/6/7/8 を使用。組合せ券種はキーを正規化して
+    0102 / 010203 のような形式で参照できるようにする。
+    """
+    type_map = {
+        "馬連": "4", "ワイド": "5", "馬単": "6",
+        "3連複": "7", "3連単": "8",
+    }
+    result = {k: {} for k in type_map}
+    try:
+        session = requests.Session()
+        for bet_type, api_type in type_map.items():
+            params = {
+                "pid": "api_get_jra_odds", "race_id": str(race_id),
+                "type": api_type, "action": "update", "sort": "odds",
+                "compress": "0", "output": "json",
+            }
+            headers = dict(REQUEST_HEADERS)
+            headers.update({
+                "Referer": f"https://race.netkeiba.com/odds/index.html?race_id={race_id}",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+            })
+            response = session.get(
+                "https://race.netkeiba.com/api/api_get_jra_odds.html",
+                params=params, headers=headers, timeout=15,
+            )
+            response.raise_for_status()
+            payload = parse_odds_api_payload(response.text)
+            if not payload:
+                params["action"] = "init"
+                retry = session.get(
+                    "https://race.netkeiba.com/api/api_get_jra_odds.html",
+                    params=params, headers=headers, timeout=15,
+                )
+                retry.raise_for_status()
+                payload = parse_odds_api_payload(retry.text)
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            odds_root = data.get("odds", {}) if isinstance(data, dict) else {}
+            rows = odds_root.get(api_type, {}) if isinstance(odds_root, dict) else {}
+            if isinstance(rows, dict):
+                for key, value in rows.items():
+                    normalized = _normalize_odds_key(key)
+                    odds = _extract_numeric_odds(value)
+                    if normalized and odds is not None:
+                        result[bet_type][normalized] = odds
+    except Exception:
+        pass
+    return result
+
+
 def fetch_win_odds_api(session, race_id: str):
     """netkeibaの単勝オッズAPIから馬番別オッズを取得する。"""
     api_url = (
@@ -1750,6 +1854,43 @@ def fetch_win_odds_api(session, race_id: str):
 
     except Exception:
         return {}
+
+
+def fetch_win_place_odds_api(race_id: str):
+    """type=1から単勝・複勝を同時取得。複勝は下限を採用。"""
+    result = {"単勝": {}, "複勝": {}}
+    try:
+        session = requests.Session()
+        params = {"pid":"api_get_jra_odds", "race_id":str(race_id), "type":"1",
+                  "action":"update", "sort":"odds", "compress":"0", "output":"json"}
+        headers = dict(REQUEST_HEADERS)
+        headers.update({"Referer":f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+                        "Accept":"application/json, text/javascript, */*; q=0.01"})
+        response = session.get("https://race.netkeiba.com/api/api_get_jra_odds.html", params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        payload = parse_odds_api_payload(response.text)
+        if not payload:
+            params["action"]="init"
+            response = session.get("https://race.netkeiba.com/api/api_get_jra_odds.html", params=params, headers=headers, timeout=15)
+            response.raise_for_status()
+            payload = parse_odds_api_payload(response.text)
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        root = data.get("odds", {}) if isinstance(data, dict) else {}
+        for api_type, name in (("1","単勝"),("2","複勝")):
+            rows = root.get(api_type, {}) if isinstance(root, dict) else {}
+            if not isinstance(rows, dict):
+                continue
+            for key, value in rows.items():
+                try:
+                    horse_no = int(str(key))
+                except Exception:
+                    continue
+                odds = _extract_numeric_odds(value)
+                if odds is not None:
+                    result[name][horse_no] = odds
+    except Exception:
+        pass
+    return result
 
 
 # ============================================================
@@ -3015,95 +3156,319 @@ def classify_special_horses(result_df):
     return df, hole, danger
 
 
-def build_bet_recommendations(result_df, budget, race_context=None):
+def _round_budget_amounts(weights, budget):
+    """100円単位で予算を配分。最低100円を保証し、端数は先頭へ寄せる。"""
+    n = len(weights)
+    if n == 0:
+        return []
+    budget = max(0, int(budget // 100) * 100)
+    if budget < n * 100:
+        # 買い目数を維持できない場合は、先頭から100円を配分
+        return [100 if i < budget // 100 else 0 for i in range(n)]
+    weights = np.asarray(weights, dtype=float)
+    if weights.sum() <= 0:
+        weights = np.ones(n)
+    weights = weights / weights.sum()
+    raw = budget * weights
+    amounts = (np.floor(raw / 100) * 100).astype(int)
+    amounts[amounts < 100] = 100
+    diff = budget - int(amounts.sum())
+    # 100円単位の残額を上位候補から追加
+    i = 0
+    while diff >= 100:
+        amounts[i % n] += 100
+        diff -= 100
+        i += 1
+    return amounts.tolist()
+
+
+def _bet_row(bet_type, ticket, amount, odds=None, rank_label=""):
+    return {
+        "券種": bet_type,
+        "買い目": ticket,
+        "推奨金額": int(amount),
+        "オッズ": float(odds) if odds is not None and pd.notna(odds) else np.nan,
+        "区分": rank_label,
+    }
+
+
+def _format_bet_lines(rows):
+    if not rows:
+        return "なし"
+    return "\n".join(
+        f"{r['買い目']} {int(r['推奨金額']):,}円"
+        for r in rows
+        if int(r.get("推奨金額", 0)) > 0
+    ) or "なし"
+
+
+def _ticket_text_by_type(rows, bet_type):
+    return _format_bet_lines([r for r in rows if r["券種"] == bet_type])
+
+
+def _scenario_from_scores(df, hole):
+    """既存のモデル順位・特注穴判定だけを使って5パターンを選ぶ。"""
+    if len(df) < 2:
+        return 1
+    p = pd.to_numeric(df["モデル確率(%)"], errors="coerce").fillna(0).to_numpy()
+    top = float(p[0])
+    second = float(p[1])
+    total = max(float(p.sum()), 1.0)
+    top_share = top / total
+    gap = top - second
+
+    if hole is not None:
+        hole_num = int(hole["馬番"])
+        top_num = int(df.iloc[0]["馬番"])
+        # ◎自身が穴ではなく、別馬に強い特注穴があるケース
+        if hole_num != top_num and float(hole["特注穴ポイント"]) >= 38 and top_share >= 0.16:
+            return 3
+        # 特注穴がかなり強く、モデル上位との差が小さいケース
+        if float(hole["特注穴ポイント"]) >= 38 and top_share < 0.16:
+            return 2
+
+    # ◎と○が拮抗しているケース
+    if top_share < 0.145 and abs(gap) <= max(1.5, top * 0.18):
+        return 4
+
+    # 軸不在：上位4頭が極端に分散
+    if top_share < 0.125:
+        return 5
+
+    return 1
+
+
+def build_bet_recommendations(result_df, budget, race_context=None, odds_maps=None):
+    """Ver.2.49 BETFORM v2。
+
+    既存のモデル評価は変更せず、評価結果から5つの買い方シチュエーションを
+    選択し、フォーメーションと推奨資金配分を生成する。
+    """
     df, hole, danger = classify_special_horses(result_df)
     df = df.sort_values("モデル確率(%)", ascending=False).reset_index(drop=True)
+    race_context = race_context or {}
+    odds_maps = odds_maps or {}
+    budget = max(100, int(budget // 100) * 100)
 
     axis = df.iloc[0]
     main1 = df.iloc[1] if len(df) > 1 else None
     main2 = df.iloc[2] if len(df) > 2 else None
+    main3 = df.iloc[3] if len(df) > 3 else None
+    main4 = df.iloc[4] if len(df) > 4 else None
+    main5 = df.iloc[5] if len(df) > 5 else None
 
-    danger_num = int(danger["馬番"]) if danger is not None else None
+    scenario = _scenario_from_scores(df, hole)
+    scenario_names = {
+        1: "① 堅軸1頭（◎）・紐荒れ狙い",
+        2: "② 特注穴馬1頭（穴◎）・勝ち確＋爆破",
+        3: "③ 堅軸（◎）＋特注穴馬（穴◎）・期待値最大",
+        4: "④ 2頭拮抗（◎・○）・一騎打ち",
+        5: "⑤ 大混戦・群雄割拠（軸不在）",
+    }
+
+    nums = [int(r["馬番"]) for r in df.itertuples()]
+    axis_num = int(axis["馬番"])
+    main1_num = int(main1["馬番"]) if main1 is not None else None
+    main2_num = int(main2["馬番"]) if main2 is not None else None
     hole_num = int(hole["馬番"]) if hole is not None else None
 
-    mains = [r for r in [main1,main2]
-             if r is not None and int(r["馬番"]) != danger_num]
+    # ラベル付き候補。既存の評価順位をそのまま使う。
+    ordered = [int(x) for x in df["馬番"].tolist() if int(x) != axis_num]
+    if hole_num in ordered:
+        ordered.remove(hole_num)
+    holes = []
+    for n in ordered:
+        row = df[df["馬番"].astype(int) == n].iloc[0]
+        if n == main1_num:
+            continue
+        if n == main2_num:
+            continue
+        holes.append(n)
+    if hole_num is not None:
+        holes = [hole_num] + holes
+    holes = holes[:4]
 
-    singles = [int(axis["馬番"])]
-    if hole_num is not None and hole_num != int(axis["馬番"]):
-        singles.append(hole_num)
+    bets = []
 
-    quinella=[]; wide=[]
-    for r in mains:
-        p=f"{int(axis['馬番'])}-{int(r['馬番'])}"
-        quinella.append(p); wide.append(p)
-    if hole_num is not None and hole_num != danger_num:
-        p=f"{int(axis['馬番'])}-{hole_num}"
-        if p not in quinella:
-            quinella.append(p); wide.append(p)
-        if mains:
-            p=f"{int(mains[0]['馬番'])}-{hole_num}"
-            if p not in wide:
-                wide.append(p)
+    def add(btype, ticket, amount, label=""):
+        odds = label_label_to_odds(df, ticket, btype, odds_maps=odds_maps)
+        bets.append(_bet_row(btype, ticket, amount, odds, label))
 
-    nums=[int(axis["馬番"])]
-    for r in mains[:2]:
-        if int(r["馬番"]) not in nums: nums.append(int(r["馬番"]))
-    if hole_num is not None and hole_num not in nums: nums.append(hole_num)
+    # ① 堅軸1頭：馬単2点＋3連単12点
+    if scenario == 1:
+        if main1_num is None or main2_num is None:
+            scenario = 4 if main1_num is not None else 2
+        else:
+            # 馬単 3000円：◎→○ 2000 / ◎→▲ 1000
+            add("馬単", f"{axis_num}→{main1_num}", 2000, "上位本線")
+            add("馬単", f"{axis_num}→{main2_num}", 1000, "本線")
+            # 3連単：2着○/▲、3着は○▲△1△2穴1穴2から重複除外して12点
+            third = [main1_num, main2_num]
+            for n in [int(x) for x in df["馬番"].tolist()[3:]]:
+                if n not in third:
+                    third.append(n)
+                if len(third) >= 6:
+                    break
+            if len(third) < 6:
+                third = list(dict.fromkeys(third + holes))[:6]
+            tris = []
+            for second in [main1_num, main2_num]:
+                for third_num in third:
+                    if third_num == second or third_num == axis_num:
+                        continue
+                    tris.append(f"{axis_num}→{second}→{third_num}")
+            tris = tris[:12]
+            # 上位3点を厚く、残りを薄く。合計7000円。
+            amounts = _round_budget_amounts([1.0 if i < 3 else 0.45 for i in range(len(tris))], 7000)
+            for i, ticket in enumerate(tris):
+                add("3連単", ticket, amounts[i], "上位本線" if i < 3 else "中穴/大穴")
 
-    import itertools
-    trio=[]
-    if len(nums)>=3:
-        for c in itertools.combinations(sorted(nums),3):
-            if danger_num is not None and danger_num in c: continue
-            trio.append("-".join(map(str,c)))
+    # ② 特注穴1頭：複勝＋ワイド＋3連複6点
+    if scenario == 2:
+        h = hole_num if hole_num is not None else (main2_num or main1_num)
+        if h is None:
+            h = axis_num
+        anchor = main1_num if main1_num is not None and main1_num != h else axis_num
+        add("複勝", str(h), 2500, "押さえ")
+        add("ワイド", f"{h}-{anchor}", 4500, "直撃本線")
+        opponents = [n for n in ordered if n not in {h, anchor}][:6]
+        if len(opponents) < 6:
+            opponents = [int(x) for x in df["馬番"].tolist() if int(x) not in {h, anchor}][:6]
+        tri = [f"{min(h,anchor)}-{max(h,anchor)}-{n}" for n in opponents[:6]]
+        amounts = _round_budget_amounts([1]*len(tri), 3000)
+        for t,a in zip(tri, amounts):
+            add("3連複", t, a, "3連複本線")
 
-    slots=len(singles)+len(quinella)+len(wide)+len(trio)
-    unit=max(100,(int(budget)//max(slots,1)//100)*100)
-    total=slots*unit
+    # ③ ◎＋特注穴：ワイド＋馬単＋3連複5点
+    if scenario == 3:
+        h = hole_num if hole_num is not None else (main2_num or main1_num)
+        add("ワイド", f"{min(axis_num,h)}-{max(axis_num,h)}", 4000, "直撃本線")
+        add("馬単", f"{axis_num}→{h}", 1000, "爆破狙い")
+        extra_nums = []
+        for rr in [main3, main4, main5]:
+            if rr is not None:
+                extra_nums.append(int(rr["馬番"]))
+        opponents = [n for n in [main1_num, main2_num] + extra_nums if n is not None and n not in {axis_num,h}]
+        tri = [f"{min(axis_num,h)}-{max(axis_num,h)}-{n}" for n in opponents[:5]]
+        amounts = _round_budget_amounts([1]*len(tri), 5000)
+        for t,a in zip(tri, amounts):
+            add("3連複", t, a, "3連複本線")
 
-    def lines(items):
-        return "\n".join(f"{x} {unit}円" for x in items) or "なし"
+    # ④ ◎○拮抗：馬単表裏＋3連単8点
+    if scenario == 4 and main1_num is not None:
+        add("馬単", f"{axis_num}→{main1_num}", 2500, "表本線")
+        add("馬単", f"{main1_num}→{axis_num}", 1500, "裏本線")
+        tail = [int(x) for x in df["馬番"].tolist() if int(x) not in {axis_num,main1_num}][:4]
+        tris=[]
+        for first, second in [(axis_num,main1_num),(main1_num,axis_num)]:
+            for third_num in tail:
+                tris.append(f"{first}→{second}→{third_num}")
+        amounts = _round_budget_amounts([1]*len(tris), 6000)
+        for t,a in zip(tris, amounts):
+            add("3連単", t, a, "3連単本線")
+
+    # ⑤ 大混戦：ワイド4頭BOX6点＋馬連4頭BOX6点
+    if scenario == 5:
+        box = [int(x) for x in df["馬番"].tolist()[:4]]
+        import itertools
+        pairs = [f"{a}-{b}" for a,b in itertools.combinations(sorted(box),2)]
+        w_amounts = _round_budget_amounts([1,1.15,1.25,1.1,1.0,0.9][:len(pairs)], 7000)
+        q_amounts = _round_budget_amounts([1]*len(pairs), 3000)
+        for t,a in zip(pairs,w_amounts): add("ワイド",t,a,"期待値傾斜")
+        for t,a in zip(pairs,q_amounts): add("馬連",t,a,"BOX")
+
+    # フォールバック：データ不足時でも既存の主要券種を返す
+    if not bets:
+        if main1_num is not None:
+            add("ワイド", f"{min(axis_num,main1_num)}-{max(axis_num,main1_num)}", budget, "フォールバック")
+        else:
+            add("単勝", str(axis_num), budget, "フォールバック")
+
+    # 実オッズが取得できた券種は、券種内の配分を実オッズで傾斜化する。
+    # 既定の券種別予算（例: 馬単3000円/3連単7000円）は維持する。
+    for btype in ["複勝", "ワイド", "馬連", "馬単", "3連複", "3連単"]:
+        rows = [r for r in bets if r["券種"] == btype]
+        if not rows:
+            continue
+        known = [float(r["オッズ"]) for r in rows if pd.notna(r.get("オッズ")) and float(r["オッズ"]) > 0]
+        if not known:
+            continue
+        category_budget = sum(int(r["推奨金額"]) for r in rows)
+        weights = []
+        for r in rows:
+            odds = r.get("オッズ")
+            if odds is not None and pd.notna(odds) and float(odds) > 0:
+                # 低オッズほど厚く。極端な穴は最低100円を維持。
+                weights.append(1.0 / float(odds))
+            else:
+                weights.append(0.0)
+        if sum(weights) > 0:
+            amounts = _round_budget_amounts(weights, category_budget)
+            for r, amount in zip(rows, amounts):
+                r["推奨金額"] = amount
+
+    # 予算変更時に固定例の金額をそのまま残さない。
+    # 各券種の基本比率を保ちながら、全体予算へ正規化する。
+    fixed_sum = sum(int(r["推奨金額"]) for r in bets)
+    if fixed_sum != budget and fixed_sum > 0:
+        weights = [max(int(r["推奨金額"]),100) for r in bets]
+        amounts = _round_budget_amounts(weights, budget)
+        for r,a in zip(bets, amounts):
+            r["推奨金額"] = a
+
+    # 0円になった行は削除。買い目数不足時の最低保証は予算側で処理。
+    bets = [r for r in bets if int(r["推奨金額"]) > 0]
 
     hole_text = f"{hole_num}番 {hole['馬名']}" if hole is not None else "なし"
     danger_text = f"{int(danger['馬番'])}番 {danger['馬名']}" if danger is not None else "なし"
 
-    race_context = race_context or {}
-    race_date = str(race_context.get("race_date") or "")
-    venue = str(race_context.get("venue") or "")
-    race_num = race_context.get("race_num")
-    race_name = str(race_context.get("race_name") or "")
-    try:
-        race_num_text = f"{int(race_num)}R" if race_num is not None else ""
-    except Exception:
-        race_num_text = str(race_num or "")
-    race_line = " ".join(x for x in [venue, race_num_text] if x)
-
-    copy = "\n".join([
+    total_amount = sum(int(r["推奨金額"]) for r in bets)
+    copy_sections = [
         "【JRA AI 推奨買い目】",
-        f"開催日：{race_date}",
-        f"レース：{race_line}",
-        f"レース名：{race_name}",
+        f"開催日：{race_context.get('race_date','')}",
+        f"レース：{race_context.get('venue','')} {race_context.get('race_num','')}R",
+        f"レース名：{race_context.get('race_name','')}",
+        f"シチュエーション：{scenario_names[scenario]}",
         "",
-        f"◎ {int(axis['馬番'])}番 {axis['馬名']}",
+        f"◎ {axis_num}番 {axis['馬名']}",
         f"○ {int(main1['馬番'])}番 {main1['馬名']}" if main1 is not None else "○ なし",
         f"▲ {int(main2['馬番'])}番 {main2['馬名']}" if main2 is not None else "▲ なし",
-        f"☆ {hole_text}",
-        f"⚠ {danger_text}",
-        "",
-        "【単勝】", lines(singles),
-        "", "【馬連】", lines(quinella),
-        "", "【ワイド】", lines(wide),
-        "", "【三連複】", lines(trio),
-        "", f"【合計参考額】{total}円",
-    ])
+        f"☆ {hole_text}", f"⚠ {danger_text}", "",
+    ]
+    for typ in ["複勝","ワイド","馬連","馬単","3連複","3連単","単勝"]:
+        rows = [r for r in bets if r["券種"] == typ]
+        if rows:
+            copy_sections += [f"【{typ}】", _format_bet_lines(rows), ""]
+    copy_sections.append(f"【合計購入額】{total_amount:,}円")
+
     return {
-        "df":df, "axis":axis, "main1":main1, "main2":main2,
-        "special_hole":hole, "danger_horse":danger,
-        "single":lines(singles), "quinella":lines(quinella),
-        "wide":lines(wide), "trifecta_box":lines(trio),
-        "copy_text":copy, "total_amount":total,
+        "df": df, "axis": axis, "main1": main1, "main2": main2,
+        "special_hole": hole, "danger_horse": danger,
+        "scenario": scenario, "scenario_name": scenario_names[scenario],
+        "bets": bets,
+        "editable_bets": [dict(r) for r in bets],
+        "single": _ticket_text_by_type(bets, "単勝"),
+        "quinella": _ticket_text_by_type(bets, "馬連"),
+        "wide": _ticket_text_by_type(bets, "ワイド"),
+        "win": _ticket_text_by_type(bets, "馬単"),
+        "trifecta_box": _ticket_text_by_type(bets, "3連複"),
+        "trifecta": _ticket_text_by_type(bets, "3連単"),
+        "copy_text": "\n".join(copy_sections),
+        "total_amount": total_amount,
     }
+
+
+def label_label_to_odds(df, ticket, bet_type, odds_maps=None):
+    """実オッズマップから買い目の個別オッズを引く。未取得ならNaN。"""
+    odds_maps = odds_maps or {}
+    if bet_type == "複勝":
+        nums = re.findall(r"\d+", str(ticket))
+        try:
+            return odds_maps.get("複勝", {}).get(int(nums[0]), np.nan)
+        except Exception:
+            return np.nan
+    key = _ticket_key(ticket, bet_type)
+    return odds_maps.get(bet_type, {}).get(key, np.nan)
 
 
 def create_bet_save_id(prediction_log_id):
@@ -3816,9 +4181,14 @@ if mode == "🏇 リアルタイム予想":
             keep="first",
         ).reset_index(drop=True)
 
+        combo_odds = fetch_combination_odds_api(fetched_info["race_id"])
+        win_place_odds = fetch_win_place_odds_api(fetched_info["race_id"])
+        odds_maps = {**combo_odds, **win_place_odds}
+
         bet_info = build_bet_recommendations(
             result_df,
             budget,
+            odds_maps=odds_maps,
             race_context={
                 "race_date": fetched_info["race_date"].strftime("%Y/%m/%d"),
                 "venue": fetched_info["venue"],
@@ -4136,13 +4506,58 @@ if mode == "🏇 リアルタイム予想":
         st.caption(
             f"{latest['race_date']}｜{fetched_info['venue']} {fetched_info['race_num']}R｜{latest['race_name']}"
         )
-        st.code(
-            bet_info["copy_text"],
-            language="text",
+        st.success(f"判定シチュエーション：**{bet_info['scenario_name']}**")
+        st.caption(
+            "既存の◎○▲・特注穴判定は変更せず、買い方だけを5パターンから選択しています。"
+            "組合せ券種はnetkeibaの実オッズを取得して表示し、未取得時は「-」にします。"
+            "推奨金額は自動算出後、下表で100円単位に手動変更できます。"
         )
-        st.write(
-            f"参考買い目総額: **{bet_info['total_amount']:,}円**"
-        )
+
+        edit_df = pd.DataFrame(bet_info.get("editable_bets", bet_info.get("bets", [])))
+        if not edit_df.empty:
+            edit_df = edit_df[["券種", "買い目", "推奨金額", "オッズ", "区分"]].copy()
+            edit_df["推奨金額"] = pd.to_numeric(edit_df["推奨金額"], errors="coerce").fillna(0).astype(int)
+            edited = st.data_editor(
+                edit_df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["券種", "買い目", "オッズ", "区分"],
+                column_config={
+                    "推奨金額": st.column_config.NumberColumn(
+                        "購入金額（円）", min_value=0, step=100, format="%d"
+                    ),
+                    "オッズ": st.column_config.NumberColumn(
+                        "個別オッズ", format="%.1f"
+                    ),
+                },
+                key="bet_amount_editor",
+            )
+            # 手動変更をセッションへ即時反映。保存ボタンではこの最終値を使用する。
+            editable_rows = []
+            for _, row in edited.iterrows():
+                editable_rows.append({
+                    "券種": str(row["券種"]),
+                    "買い目": str(row["買い目"]),
+                    "推奨金額": int(max(0, float(row["推奨金額"] or 0))),
+                    "オッズ": row["オッズ"],
+                    "区分": str(row["区分"]),
+                })
+            bet_info["editable_bets"] = editable_rows
+            bet_info["total_amount"] = sum(r["推奨金額"] for r in editable_rows)
+            latest["bet_info"] = bet_info
+            st.session_state["latest_prediction"] = latest
+
+            preview_sections = ["【JRA AI 推奨買い目】", f"シチュエーション：{bet_info['scenario_name']}", ""]
+            for typ in ["複勝", "ワイド", "馬連", "馬単", "3連複", "3連単", "単勝"]:
+                rows = [r for r in editable_rows if r["券種"] == typ and r["推奨金額"] > 0]
+                if rows:
+                    preview_sections += [f"【{typ}】", _format_bet_lines(rows), ""]
+            preview_sections.append(f"【合計購入額】{bet_info['total_amount']:,}円")
+            bet_info["copy_text"] = "\n".join(preview_sections)
+            st.code(bet_info["copy_text"], language="text")
+            st.write(f"最終購入額: **{bet_info['total_amount']:,}円**")
+        else:
+            st.info("生成できる買い目がありません。")
         st.warning(
             "⚠️ 買い目はモデル評価を馬券形式へ変換した候補です。"
             "的中・利益・期待値を保証するものではありません。"
@@ -4218,14 +4633,14 @@ if mode == "🏇 リアルタイム予想":
                         "単勝人気上位4頭の中でモデル評価シェア最低"
                         if danger_horse is not None else ""
                     ),
-                    "単勝買い目": bet_info["single"],
-                    "馬連買い目": bet_info["quinella"],
-                    "ワイド買い目": bet_info["wide"],
-                    "馬単買い目": "",
-                    "三連複買い目": bet_info["trifecta_box"],
-                    "三連単買い目": "",
+                    "単勝買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "単勝"),
+                    "馬連買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "馬連"),
+                    "ワイド買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "ワイド"),
+                    "馬単買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "馬単"),
+                    "三連複買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "3連複"),
+                    "三連単買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "3連単"),
                     "コピペ用買い目": bet_info["copy_text"],
-                    "買い目総額": bet_info["total_amount"],
+                    "買い目総額": sum(int(r.get("推奨金額",0)) for r in bet_info.get("editable_bets", [])),
                     "買い目保存フラグ": "保存済み",
                     "結果": "未確定",
                     "回収額": 0,
