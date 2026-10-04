@@ -3266,7 +3266,8 @@ def build_bet_recommendations(result_df, budget, race_context=None, odds_maps=No
         5: "⑤ 大混戦・群雄割拠（軸不在）",
     }
 
-    nums = [int(r["馬番"]) for r in df.itertuples()]
+    # itertuples() は名前付きタプルを返すため r["馬番"] は不正。
+    # この変数は後続処理で未使用なので生成自体を行わない。
     axis_num = int(axis["馬番"])
     main1_num = int(main1["馬番"]) if main1 is not None else None
     main2_num = int(main2["馬番"]) if main2 is not None else None
