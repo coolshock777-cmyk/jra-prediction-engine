@@ -905,6 +905,27 @@ def extract_kinryo(row):
     return None
 
 
+
+def extract_bataiju(row):
+    """レースカード行に馬体重/増減が含まれる場合だけ取得する。
+    未発表レースではNoneとし、推測でポイントを付けない。
+    """
+    try:
+        texts = [normalize_text(td.get_text(" ", strip=True)) for td in row.find_all("td")]
+        for txt in texts:
+            # 例: 486(+4), 486（+4）, 486(-6)
+            m = re.search(r"(?<!\d)(3\d{2}|4\d{2}|5\d{2}|6\d{2}|7\d{2})\s*[\(（]\s*([+-]\d{1,2})\s*[\)）]", txt)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+            # 例: 486 +4
+            m = re.search(r"(?<!\d)(3\d{2}|4\d{2}|5\d{2}|6\d{2}|7\d{2})\s+([+-]\d{1,2})(?!\d)", txt)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None, None
+
+
 def extract_odds_from_row(row):
     # まずクラス名に Odds が含まれる要素を探す
     candidates = []
@@ -2700,6 +2721,10 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                 except Exception:
                     previous_jockey = ""
 
+                # 馬体重はレースカードに発表済みの場合のみ取得。
+                # 未発表時は推測せずNoneのままにする。
+                bataiju, bataiju_diff = extract_bataiju(row)
+
                 # 馬詳細URLを保持。脚質未取得馬の最終フォールバックで使用する。
                 horse_url = ""
                 try:
@@ -2723,6 +2748,8 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     "調教師": trainer,
                     "前走騎手": previous_jockey,
                     "斤量": kinryo,
+                    "馬体重": bataiju,
+                    "馬体重増減": bataiju_diff,
                     "脚質": style,
                     "脚質表示": style_display,
                     "脚質取得元": style_source,
@@ -2738,6 +2765,8 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     quality += 2
                 if candidate["斤量"] is not None:
                     quality += 2
+                if candidate["馬体重"] is not None:
+                    quality += 1
                 if candidate["脚質"] != "不明":
                     quality += 2
                 if candidate["オッズ"] is not None:
@@ -3053,7 +3082,19 @@ def calculate_model_score(
     front_bias, inside_bias, outer_bias, green_belt, g1_mode,
     leading_data=None,
 ):
+    """予想ロジック本体。
+
+    既存の騎手/調教師評価を維持しつつ、これまで弱かった
+    斤量・脚質・馬場適性を明示的に加味する。
+    馬体重増減は取得できた場合のみ評価し、未取得時は加点/減点しない。
+    """
     score = 0.0
+    factor = {
+        "斤量評価": 0.0,
+        "馬体重増減評価": 0.0,
+        "脚質適性評価": 0.0,
+        "馬場適性評価": 0.0,
+    }
     horse_num = int(horse.get("馬番", 0) or 0)
     waku_num = int(horse.get("枠番", 0) or 0)
     jockey = normalize_person_name(horse.get("騎手", ""))
@@ -3066,6 +3107,7 @@ def calculate_model_score(
         track_type, distance
     )
 
+    # 騎手・調教師・継続/乗替・相性評価は従来どおり。
     for key in [
         "騎手評価","調教師評価","継続騎乗評価","乗り替わり評価",
         "騎手×競馬場","騎手×距離","騎手×コース",
@@ -3078,51 +3120,119 @@ def calculate_model_score(
     elif "川田" in jockey:
         score += safe_log_multiplier(1.04)
 
+    # 斤量：同レース内の中央値からの相対評価。
+    weights = [
+        float(h.get("斤量")) for h in fetched_info["horses"]
+        if h.get("斤量") is not None
+    ]
+    kinryo = horse.get("斤量")
+    if kinryo is not None and weights:
+        median_w = float(np.median(weights))
+        diff = float(kinryo) - median_w
+        if diff <= -1.5:
+            factor["斤量評価"] = np.log(1.035)
+        elif diff <= -0.5:
+            factor["斤量評価"] = np.log(1.015)
+        elif diff >= 2.0:
+            factor["斤量評価"] = np.log(0.975)
+        elif diff >= 1.0:
+            factor["斤量評価"] = np.log(0.99)
+        score += factor["斤量評価"]
+
+    # 馬体重増減：発表済みの場合のみ。±4kg程度を中立域として、
+    # 極端な増減を小さく減点、適度な絞り/増加は条件に応じて微加点。
+    diff = horse.get("馬体重増減")
+    if diff is not None:
+        try:
+            d = int(diff)
+            if -8 <= d <= -2:
+                factor["馬体重増減評価"] = np.log(1.025)
+            elif 2 <= d <= 6:
+                factor["馬体重増減評価"] = np.log(1.015)
+            elif d <= -12 or d >= 10:
+                factor["馬体重増減評価"] = np.log(0.975)
+            score += factor["馬体重増減評価"]
+        except Exception:
+            pass
+
+    # 脚質適性：今回の馬場/展開バイアスと脚質を直接評価。
     if front_bias and kyaku_rate >= 0.70 and style in {"逃","先"}:
-        score += safe_log_multiplier(1.08)
+        factor["脚質適性評価"] = np.log(1.08)
+    elif front_bias and style in {"逃","先"}:
+        factor["脚質適性評価"] = np.log(1.04)
+    elif front_bias and style in {"差","追"}:
+        factor["脚質適性評価"] = np.log(0.985)
+
+    if inside_bias and waku_num in {1,2}:
+        factor["脚質適性評価"] += np.log(1.02)
+    if outer_bias and waku_num in {7,8}:
+        factor["脚質適性評価"] += np.log(1.02)
+    score += factor["脚質適性評価"]
+
+    # 馬場適性：コース/馬場バイアスを独立項目として記録。
+    # 「ダート1200内枠」など既存補正もここへ集約。
+    if track_type == "ダート" and distance == "1200m" and waku_num in [1,2]:
+        factor["馬場適性評価"] += np.log(1.05)
+    if green_belt and horse_num == 1:
+        factor["馬場適性評価"] += np.log(1.04)
+    if inside_bias and waku_num in [1,2]:
+        factor["馬場適性評価"] += np.log(1.015)
+    if outer_bias and waku_num in [7,8]:
+        factor["馬場適性評価"] += np.log(1.015)
+    score += factor["馬場適性評価"]
+
+    # 既存の特殊補正は維持。
     if inside_bias:
         if waku_num in [1,2] or (waku_num == 0 and horse_num <= 2):
             score += safe_log_multiplier(1.05)
     if outer_bias:
         if waku_num in [7,8] or (waku_num == 0 and horse_num >= total_horses-2):
             score += safe_log_multiplier(1.05)
-    if track_type == "ダート" and distance == "1200m" and waku_num in [1,2]:
-        score += safe_log_multiplier(1.08)
-    if green_belt and horse_num == 1:
-        score += safe_log_multiplier(1.06)
     if g1_mode and horse_num in [1,3,7]:
         score += safe_log_multiplier(1.03)
 
+    feature["_予想因子"] = factor
     return score, feature
 
 
+
 def calculate_special_hole_score(row):
+    """特注穴は「人気薄なのに予想因子が複数重なる馬」を拾う。
+    Value Indexだけで穴判定しない。
+    """
     score = 0.0
     reasons = []
-    if float(row.get("モデル確率(%)",0) or 0) >= 7:
-        score += 18; reasons.append("モデル確率")
+    if float(row.get("モデル確率(%)",0) or 0) >= 6:
+        score += 10; reasons.append("モデル確率")
     if float(row.get("Value Index",0) or 0) >= 1.20:
-        score += 12; reasons.append("Value Index")
+        score += 4; reasons.append("Value Index")
     if float(row.get("騎手評価pt",0) or 0) > 0:
-        score += 12; reasons.append("騎手評価")
+        score += 8; reasons.append("騎手評価")
     if float(row.get("調教師評価pt",0) or 0) > 0:
-        score += 10; reasons.append("調教師評価")
+        score += 7; reasons.append("調教師評価")
     if row.get("騎乗判定") == "継続騎乗":
-        score += 8; reasons.append("継続騎乗")
-    if row.get("騎乗判定") == "乗り替わり":
-        score += 4; reasons.append("乗り替わり")
+        score += 6; reasons.append("継続騎乗")
+    elif row.get("騎乗判定") == "乗り替わり":
+        score += 3; reasons.append("乗り替わり")
+
     for key, pts, label in [
-        ("騎手×競馬場pt",8,"騎手×競馬場"),
-        ("騎手×距離pt",7,"騎手×距離"),
-        ("騎手×コースpt",7,"騎手×コース"),
-        ("調教師×競馬場pt",5,"調教師×競馬場"),
-        ("調教師×コースpt",5,"調教師×コース"),
+        ("騎手×競馬場pt",5,"騎手×競馬場"),
+        ("騎手×距離pt",5,"騎手×距離"),
+        ("騎手×コースpt",5,"騎手×コース"),
+        ("調教師×競馬場pt",4,"調教師×競馬場"),
+        ("調教師×コースpt",4,"調教師×コース"),
+        ("斤量評価pt",5,"斤量適性"),
+        ("馬体重増減評価pt",4,"馬体重増減"),
+        ("脚質適性pt",6,"脚質適性"),
+        ("馬場適性pt",6,"馬場適性"),
     ]:
         if float(row.get(key,0) or 0) > 0:
             score += pts; reasons.append(label)
+
     if row.get("脚質") in {"逃","先"}:
-        score += 5; reasons.append("前方脚質")
+        score += 3; reasons.append("前方脚質")
     return round(score,1), "、".join(reasons) if reasons else "複数特徴量"
+
 
 
 def classify_special_horses(result_df):
@@ -3151,7 +3261,7 @@ def classify_special_horses(result_df):
         ["特注穴ポイント","モデル確率(%)"],
         ascending=[False,False]
     ).iloc[0] if not pool.empty else None
-    if hole is not None and hole["特注穴ポイント"] < 25:
+    if hole is not None and hole["特注穴ポイント"] < 20:
         hole = None
     return df, hole, danger
 
@@ -3232,10 +3342,10 @@ def _scenario_from_scores(df, hole):
 
     # 出走頭数に応じた「堅軸」の基準。
     # 旧版の固定14.5%より、少頭数/多頭数の差を吸収する。
-    strong_axis = top >= equal * 1.70 and top_gap_ratio >= 0.16
+    strong_axis = top >= equal * 1.85 and top_gap_ratio >= 0.20
 
     # ◎と○がかなり近い場合は一騎打ち。
-    close_two = top2_ratio <= 1.16 and top_gap_ratio <= 0.16
+    close_two = top2_ratio <= 1.08 and top_gap_ratio <= 0.08
 
     hole_points = 0.0
     hole_num = None
@@ -3249,7 +3359,7 @@ def _scenario_from_scores(df, hole):
     # 特注穴の「強さ」は既存の特注穴ポイントを利用。
     # 25pt以上で表示対象なので、28pt以上を実戦フォーメーション判定の
     # 強い穴として扱う。
-    strong_hole = hole_is_separate and hole_points >= 28
+    strong_hole = hole_is_separate and hole_points >= 24
 
     # ③を最優先：堅軸＋強い特注穴。
     if strong_axis and strong_hole:
@@ -4189,6 +4299,8 @@ if mode == "🏇 リアルタイム予想":
                 "騎手": str(horse.get("騎手") or "不明"),
                 "調教師": str(horse.get("調教師") or "不明"),
                 "斤量": float(horse["斤量"]) if horse.get("斤量") is not None else np.nan,
+                "馬体重": float(horse["馬体重"]) if horse.get("馬体重") is not None else np.nan,
+                "馬体重増減": float(horse["馬体重増減"]) if horse.get("馬体重増減") is not None else np.nan,
                 "脚質": str(horse.get("脚質") or "不明"),
                 "脚質取得元": str(horse.get("脚質取得元") or "未取得"),
                 "単勝オッズ": float(odds) if odds is not None else np.nan,
@@ -4200,6 +4312,10 @@ if mode == "🏇 リアルタイム予想":
                 "調教師評価pt": round(max(feature["調教師評価"], 0) * 100, 2),
                 "継続騎乗pt": round(max(feature["継続騎乗評価"], 0) * 100, 2),
                 "乗り替わりpt": round(max(feature["乗り替わり評価"], 0) * 100, 2),
+                "斤量評価pt": round(max(feature.get("_予想因子", {}).get("斤量評価", 0), 0) * 100, 2),
+                "馬体重増減評価pt": round(max(feature.get("_予想因子", {}).get("馬体重増減評価", 0), 0) * 100, 2),
+                "脚質適性pt": round(max(feature.get("_予想因子", {}).get("脚質適性評価", 0), 0) * 100, 2),
+                "馬場適性pt": round(max(feature.get("_予想因子", {}).get("馬場適性評価", 0), 0) * 100, 2),
                 "騎手×競馬場pt": round(max(feature["騎手×競馬場"], 0) * 100, 2),
                 "騎手×距離pt": round(max(feature["騎手×距離"], 0) * 100, 2),
                 "騎手×コースpt": round(max(feature["騎手×コース"], 0) * 100, 2),
