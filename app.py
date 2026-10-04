@@ -2371,9 +2371,13 @@ def reconcile_bet_history_with_result(race_id, result):
         returned, hits = calculate_bet_return_from_result(row, payout_map)
         investment = float(pd.to_numeric(pd.Series([row.get("買い目総額",0)]), errors="coerce").fillna(0).iloc[0])
         profit = returned - investment
+        # 自動照合済みの買い目は「確定」にする。
+        # 以前は「的中/不的中」を入れていたため、成績ログ画面の
+        # 「結果 != 確定」の未処理一覧に再び出てしまい、手動処理時に
+        # 正しい自動計算済み回収額が上書きされる問題があった。
         result_label = "的中" if returned > 0 else "不的中"
         detail = " / ".join(hits) if hits else "的中買い目なし"
-        bet_df.loc[idx, "結果"] = result_label
+        bet_df.loc[idx, "結果"] = "確定"
         bet_df.loc[idx, "回収額"] = returned
         bet_df.loc[idx, "収支"] = profit
         bet_df.loc[idx, "メモ"] = f"払戻自動照合: {detail}"
@@ -5224,12 +5228,37 @@ elif mode == "📊 成績ダッシュボード・結果入力":
                     else:
                         idx = match_idx[0]
                         investment = float(all_history_df.loc[idx, "投資額"])
+
+                        # 買い目履歴側ですでに払戻自動照合が済んでいる場合は、
+                        # 手動入力の0円等で正しい回収額を上書きしない。
+                        auto_return = None
+                        auto_profit = None
+                        auto_memo = ""
+                        try:
+                            related_bets = load_bet_history_df()
+                            if not related_bets.empty:
+                                related_bets = normalize_bet_columns(related_bets)
+                                bmask = (related_bets["予測ログID"].astype(str) == str(target_log_id))
+                                if bmask.any():
+                                    rr = related_bets[bmask]
+                                    rr_auto = rr[rr["メモ"].astype(str).str.startswith("払戻自動照合:")]
+                                    rr_return = pd.to_numeric(rr_auto["回収額"], errors="coerce").fillna(0)
+                                    if not rr_auto.empty and float(rr_return.max()) > 0:
+                                        auto_return = float(rr_return.max())
+                                        auto_profit = auto_return - investment
+                                        auto_memo = str(rr_auto.iloc[int(rr_return.argmax())].get("メモ", ""))
+                        except Exception:
+                            pass
+
+                        final_return = auto_return if auto_return is not None else float(input_return)
+                        final_profit = final_return - investment
+                        final_memo = auto_memo if auto_return is not None else input_memo
                         all_history_df.loc[idx, "確定フラグ"] = "確定"
-                        all_history_df.loc[idx, "回収額"] = input_return
-                        all_history_df.loc[idx, "収支"] = input_return - investment
-                        all_history_df.loc[idx, "メモ"] = input_memo
+                        all_history_df.loc[idx, "回収額"] = final_return
+                        all_history_df.loc[idx, "収支"] = final_profit
+                        all_history_df.loc[idx, "メモ"] = final_memo
                         if save_history_df(all_history_df):
-                            _sync_result_to_related_bet(target_log_id, "確定", input_return, input_return - investment, input_memo)
+                            _sync_result_to_related_bet(target_log_id, "確定", final_return, final_profit, final_memo)
                             st.success("✅ 確定成績を保存しました。予測履歴と関連する買い目履歴にも結果を反映しました。")
                             st.rerun()
 
@@ -5290,6 +5319,18 @@ elif mode == "📊 成績ダッシュボード・結果入力":
             else:
                 st.info("未処理の買い目はありません。")
 
+            # 過去版で自動照合した「的中/不的中」が残っている場合は、
+            # 自動照合済みとして確定扱いに正規化する。
+            # 「払戻自動照合:」が付いた行だけを対象にし、通常の手動入力は変更しない。
+            auto_reconciled = (
+                bet_df["結果"].astype(str).isin(["的中", "不的中"])
+                & bet_df["メモ"].astype(str).str.startswith("払戻自動照合:")
+            )
+            if auto_reconciled.any():
+                all_bet_df.loc[bet_df.index[auto_reconciled], "結果"] = "確定"
+                bet_df.loc[bet_df.index[auto_reconciled], "結果"] = "確定"
+                save_bet_history_df(all_bet_df)
+
             pending = bet_df[bet_df["結果"] != "確定"].copy()
             if not pending.empty:
                 st.markdown("### 📝 保存済み買い目の結果入力")
@@ -5310,12 +5351,18 @@ elif mode == "📊 成績ダッシュボード・結果入力":
                         i = idx[0]
                         all_bet_df = normalize_bet_columns(all_bet_df)
                         amount = float(pd.to_numeric(all_bet_df.loc[i, "買い目総額"], errors="coerce") or 0)
+                        existing_memo = str(all_bet_df.loc[i, "メモ"] or "")
+                        existing_return = float(pd.to_numeric(pd.Series([all_bet_df.loc[i, "回収額"]]), errors="coerce").fillna(0).iloc[0])
+                        # 自動照合済みの回収額がある場合は、手動確定で0円等に戻さない。
+                        final_ret = existing_return if existing_memo.startswith("払戻自動照合:") and existing_return > 0 else float(ret)
+                        final_profit = final_ret - amount
+                        final_memo = existing_memo if final_ret == existing_return and existing_memo.startswith("払戻自動照合:") else str(memo or "")
                         all_bet_df.loc[i, "結果"] = "確定"
-                        all_bet_df.loc[i, "回収額"] = float(ret)
-                        all_bet_df.loc[i, "収支"] = float(ret) - amount
-                        all_bet_df.loc[i, "メモ"] = str(memo or "")
+                        all_bet_df.loc[i, "回収額"] = final_ret
+                        all_bet_df.loc[i, "収支"] = final_profit
+                        all_bet_df.loc[i, "メモ"] = final_memo
                         if save_bet_history_df(all_bet_df):
-                            _sync_result_to_related_prediction(row, "確定", ret, float(ret) - amount, memo)
+                            _sync_result_to_related_prediction(row, "確定", final_ret, final_profit, final_memo)
                             st.success("✅ 買い目結果を確定しました。予測履歴にも結果を反映しました。")
                             st.rerun()
 
