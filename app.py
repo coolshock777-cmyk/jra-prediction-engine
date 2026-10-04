@@ -240,12 +240,13 @@ BET_CSV_FILENAME = "JRA_Bet_History.csv"
 LIVE_LOG_START_DATE = "2026-10-04"
 
 CSV_COLUMNS = [
-    "予測ログID", "レースID", "レース名", "開催日", "予想日時",
+    "予測ログID", "レースID", "レース名", "開催日", "レース番号", "予想日時",
     "データ取得日時", "コース", "距離", "馬場状態", "出走頭数",
     "勝負度", "軸馬", "相手馬", "軸馬オッズ", "バイアス履歴",
     "モデルバージョン", "確定フラグ", "回収額", "収支", "メモ",
     "投資額", "オッズ状態", "オッズ取得率",
     "結果着順", "結果払戻", "結果取得日時",
+    "推奨買い目一覧", "的中買い目詳細", "不的中買い目詳細",
 ]
 
 BET_CSV_COLUMNS = [
@@ -255,7 +256,8 @@ BET_CSV_COLUMNS = [
     "特注穴馬根拠", "⚠危険な人気馬", "危険人気馬モデル評価シェア",
     "危険人気馬判定根拠", "単勝買い目", "馬連買い目", "ワイド買い目",
     "馬単買い目", "三連複買い目", "三連単買い目",
-    "コピペ用買い目", "買い目総額", "買い目保存フラグ",
+    "コピペ用買い目", "推奨買い目一覧", "的中買い目詳細", "不的中買い目詳細",
+    "買い目総額", "買い目保存フラグ",
     "結果", "回収額", "収支", "メモ", "CSVダウンロード済み",
 ]
 
@@ -334,11 +336,12 @@ def sanitize_df_types(df: pd.DataFrame) -> pd.DataFrame:
         "収支", "投資額", "オッズ取得率",
     ]
     text_cols = [
-        "予測ログID", "レースID", "レース名", "開催日", "予想日時",
+        "予測ログID", "レースID", "レース名", "開催日", "レース番号", "予想日時",
         "データ取得日時", "コース", "距離", "馬場状態", "勝負度",
         "軸馬", "相手馬", "バイアス履歴", "モデルバージョン",
         "確定フラグ", "メモ", "オッズ状態",
         "結果着順", "結果払戻", "結果取得日時",
+        "推奨買い目一覧", "的中買い目詳細", "不的中買い目詳細",
     ]
 
     for col in numeric_cols:
@@ -2369,6 +2372,31 @@ def reconcile_bet_history_with_result(race_id, result):
     for idx in bet_df.index[mask]:
         row = bet_df.loc[idx].to_dict()
         returned, hits = calculate_bet_return_from_result(row, payout_map)
+        all_items = []
+        field_map = [("単勝", "単勝買い目"), ("複勝", "複勝買い目"),
+                     ("ワイド", "ワイド買い目"), ("馬連", "馬連買い目"),
+                     ("馬単", "馬単買い目"), ("3連複", "三連複買い目"),
+                     ("3連単", "三連単買い目")]
+        for bt, field in field_map:
+            for ticket, amount in _parse_saved_bet_lines(row.get(field, "")):
+                all_items.append((bt, ticket, amount))
+        for ticket, amount in _parse_saved_bet_lines(row.get("コピペ用買い目", "")):
+            if re.search(r"^複勝\s*", str(ticket)):
+                t = re.sub(r"^複勝\s*", "", str(ticket)).strip()
+                if not any(bt == "複勝" and t == tk and amount == amt for bt, tk, amt in all_items):
+                    all_items.append(("複勝", t, amount))
+        hit_keys = set()
+        for h in hits:
+            m = re.match(r"(単勝|複勝|馬連|ワイド|馬単|3連複|3連単)\s+(.+?): 払戻", h)
+            if m:
+                hit_keys.add((m.group(1), _canonical_payout_key(m.group(2), m.group(1))))
+        losing_items = []
+        for bt, ticket, amount in all_items:
+            if (bt, _canonical_payout_key(ticket, bt)) not in hit_keys:
+                losing_items.append(f"{bt} {ticket} {int(amount):,}円")
+        recommended_catalog = _compose_bet_catalog_from_row(row)
+        hit_detail = _format_hit_details(hits) if '_format_hit_details' in globals() else (" / ".join(hits) if hits else "的中買い目なし")
+        losing_detail = " / ".join(losing_items) if losing_items else "なし"
         investment = float(pd.to_numeric(pd.Series([row.get("買い目総額",0)]), errors="coerce").fillna(0).iloc[0])
         profit = returned - investment
         # 自動照合済みの買い目は「確定」にする。
@@ -2377,13 +2405,16 @@ def reconcile_bet_history_with_result(race_id, result):
         # 正しい自動計算済み回収額が上書きされる問題があった。
         result_label = "的中" if returned > 0 else "不的中"
         detail = " / ".join(hits) if hits else "的中買い目なし"
+        bet_df.loc[idx, "推奨買い目一覧"] = recommended_catalog
+        bet_df.loc[idx, "的中買い目詳細"] = detail
+        bet_df.loc[idx, "不的中買い目詳細"] = losing_detail
         bet_df.loc[idx, "結果"] = "確定"
         bet_df.loc[idx, "回収額"] = returned
         bet_df.loc[idx, "収支"] = profit
         bet_df.loc[idx, "メモ"] = f"払戻自動照合: {detail}"
         summary[str(row.get("予測ログID", ""))] = {
             "return": returned, "investment": investment, "profit": profit,
-            "result": result_label, "detail": detail,
+            "result": result_label, "detail": detail, "losing_detail": losing_detail,
         }
     if not save_bet_history_df(bet_df):
         return summary, "買い目履歴の保存に失敗"
@@ -2570,6 +2601,16 @@ def apply_race_result_to_history(race_id: str, result: dict):
                     history_df.loc[hidx, "確定フラグ"] = "確定"
                     history_df.loc[hidx, "回収額"] = float(info["return"])
                     history_df.loc[hidx, "収支"] = float(info["profit"])
+                    history_df.loc[hidx, "的中買い目詳細"] = str(info.get("detail", ""))
+                    history_df.loc[hidx, "不的中買い目詳細"] = str(info.get("losing_detail", ""))
+                    if not str(history_df.loc[hidx, "推奨買い目一覧"] or "").strip():
+                        try:
+                            related = load_bet_history_df()
+                            rb = related[related["予測ログID"].astype(str) == str(log_id)] if not related.empty else related
+                            if not rb.empty:
+                                history_df.loc[hidx, "推奨買い目一覧"] = _compose_bet_catalog_from_row(rb.iloc[0])
+                        except Exception:
+                            pass
                     history_df.loc[hidx, "メモ"] = f"払戻自動照合: {info['detail']}"
         save_history_df(history_df)
 
@@ -3591,6 +3632,49 @@ def _ticket_text_by_type(rows, bet_type):
     return _format_bet_lines([r for r in rows if r["券種"] == bet_type])
 
 
+def _format_all_bet_catalog(rows):
+    """保存時点の全推奨買い目を券種付きで固定保存する。"""
+    parts = []
+    order = ["単勝", "複勝", "ワイド", "馬連", "馬単", "3連複", "3連単"]
+    for bet_type in order:
+        type_rows = [r for r in rows if str(r.get("券種", "")) == bet_type and int(r.get("推奨金額", 0) or 0) > 0]
+        if not type_rows:
+            continue
+        lines = [f"{bet_type} {r.get('買い目','')} {int(r.get('推奨金額',0)):,}円" for r in type_rows]
+        parts.append(" / ".join(lines))
+    return " / ".join(parts) if parts else "なし"
+
+
+def _race_number_from_id(race_id):
+    try:
+        return f"{int(str(race_id)[-2:])}R"
+    except Exception:
+        return ""
+
+
+def _compose_bet_catalog_from_row(row):
+    """既存買い目履歴から、後付け用の全推奨買い目一覧を作る。"""
+    field_map = [
+        ("単勝", "単勝買い目"), ("複勝", "複勝買い目"),
+        ("ワイド", "ワイド買い目"), ("馬連", "馬連買い目"),
+        ("馬単", "馬単買い目"), ("3連複", "三連複買い目"),
+        ("3連単", "三連単買い目"),
+    ]
+    parts = []
+    for typ, field in field_map:
+        text = str(row.get(field, "") or "").strip()
+        if text and text != "なし":
+            lines = [x.strip() for x in text.splitlines() if x.strip()]
+            if lines:
+                parts.append(" / ".join(f"{typ} {x}" for x in lines))
+    copy_text = str(row.get("コピペ用買い目", "") or "")
+    if not any("複勝" in x for x in parts):
+        p_lines = [x.strip() for x in copy_text.splitlines() if "複勝" in x and "円" in x]
+        if p_lines:
+            parts.append(" / ".join(p_lines))
+    return " / ".join(parts) if parts else "なし"
+
+
 def _scenario_from_scores(df, hole):
     """既存のモデル順位・特注穴判定だけを使って5パターンを選ぶ。
 
@@ -4071,6 +4155,34 @@ def filter_live_bet_df(df: pd.DataFrame) -> pd.DataFrame:
     work = normalize_bet_columns(df)
     dates = pd.to_datetime(work["開催日"], errors="coerce")
     return work.loc[dates >= live_start_timestamp()].copy()
+
+
+def enrich_history_log_fields(history_df):
+    """旧CSVにもレース番号・推奨買い目を後付けし、空欄だけ補完する。"""
+    if history_df is None or history_df.empty:
+        return history_df, False
+    work = normalize_history_columns(history_df)
+    changed = False
+    for idx in work.index:
+        if not str(work.at[idx, "レース番号"]).strip():
+            rn = _race_number_from_id(work.at[idx, "レースID"])
+            if rn:
+                work.at[idx, "レース番号"] = rn
+                changed = True
+    try:
+        bet_df = load_bet_history_df()
+        if not bet_df.empty:
+            for idx in work.index:
+                if str(work.at[idx, "推奨買い目一覧"]).strip() in {"", "nan"}:
+                    rb = bet_df[bet_df["予測ログID"].astype(str) == str(work.at[idx, "予測ログID"])]
+                    if not rb.empty:
+                        work.at[idx, "推奨買い目一覧"] = _compose_bet_catalog_from_row(rb.iloc[0])
+                        work.at[idx, "的中買い目詳細"] = str(rb.iloc[0].get("的中買い目詳細", "未確定"))
+                        work.at[idx, "不的中買い目詳細"] = str(rb.iloc[0].get("不的中買い目詳細", "未確定"))
+                        changed = True
+    except Exception:
+        pass
+    return work, changed
 
 
 # ============================================================
@@ -5073,6 +5185,9 @@ if mode == "🏇 リアルタイム予想":
                     "三連複買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "3連複"),
                     "三連単買い目": _ticket_text_by_type(bet_info.get("editable_bets", []), "3連単"),
                     "コピペ用買い目": bet_info["copy_text"],
+                    "推奨買い目一覧": _format_all_bet_catalog(bet_info.get("editable_bets", [])),
+                    "的中買い目詳細": "未確定",
+                    "不的中買い目詳細": "未確定",
                     "買い目総額": sum(int(r.get("推奨金額",0)) for r in bet_info.get("editable_bets", [])),
                     "買い目保存フラグ": "保存済み",
                     "結果": "未確定",
@@ -5102,6 +5217,7 @@ if mode == "🏇 リアルタイム予想":
                         "レースID": latest["race_id"],
                         "レース名": latest["race_name"],
                         "開催日": latest["race_date"],
+                        "レース番号": fetched_info.get("race_num", _race_number_from_id(latest["race_id"])),
                         "予想日時": latest["predict_time"],
                         "データ取得日時": latest["data_fetched_at"],
                         "コース": latest["course"],
@@ -5121,6 +5237,9 @@ if mode == "🏇 リアルタイム予想":
                         "回収額": 0,
                         "収支": 0,
                         "メモ": "買い目保存済み",
+                        "推奨買い目一覧": _format_all_bet_catalog(bet_info.get("editable_bets", [])),
+                        "的中買い目詳細": "未確定",
+                        "不的中買い目詳細": "未確定",
                         "投資額": bet_info["total_amount"],
                         "オッズ状態": latest["odds_status"],
                         "オッズ取得率": latest["odds_coverage"],
@@ -5164,11 +5283,15 @@ elif mode == "📊 成績ダッシュボード・結果入力":
 
     # 全履歴はそのまま保持し、ダッシュボードだけ実戦開始日以降に絞る。
     all_history_df = load_history_df()
+    all_history_df, _history_fields_changed = enrich_history_log_fields(all_history_df)
     if all_history_df.empty:
         st.info("まだ予測履歴がありません。")
         st.stop()
 
     all_history_df = sanitize_df_types(all_history_df)
+    if _history_fields_changed:
+        # 既存ログの空欄だけを補完。集計値・結果・投資額は変更しない。
+        save_history_df(all_history_df)
     # df は表示・集計専用。保存処理には all_history_df を使う。
     df = filter_live_history_df(all_history_df)
 
