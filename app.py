@@ -3253,6 +3253,43 @@ mode = st.sidebar.radio(
 # 10. リアルタイム予想
 # ============================================================
 
+# ============================================================
+# Ver.2.49 実戦ログ表示・集計フィルタ
+# ============================================================
+
+def live_start_timestamp():
+    """実戦ログ集計開始日をTimestampで返す。"""
+    return pd.Timestamp(LIVE_LOG_START_DATE)
+
+
+def filter_live_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    """表示・集計専用。元DataFrameを変更せず、実戦開始日以降だけ返す。
+
+    注意: 戻り値は表示・集計専用のコピー。
+    結果確定などの保存処理では、必ず元CSV全体を読み込んだDataFrameを更新する。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=CSV_COLUMNS)
+
+    work = normalize_history_columns(df)
+    dates = pd.to_datetime(work["開催日"], errors="coerce")
+    return work.loc[dates >= live_start_timestamp()].copy()
+
+
+def filter_live_bet_df(df: pd.DataFrame) -> pd.DataFrame:
+    """表示・集計専用。元DataFrameを変更せず、実戦開始日以降だけ返す。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=BET_CSV_COLUMNS)
+
+    work = normalize_bet_columns(df)
+    dates = pd.to_datetime(work["開催日"], errors="coerce")
+    return work.loc[dates >= live_start_timestamp()].copy()
+
+
+# ============================================================
+# 11. 成績ダッシュボード
+# ============================================================
+
 if mode == "🏇 リアルタイム予想":
 
     st.header("🏇 リアルタイム予想 & スコアリング")
@@ -4269,10 +4306,6 @@ if mode == "🏇 リアルタイム予想":
 
 
 
-# ============================================================
-# 11. 成績ダッシュボード
-# ============================================================
-
 elif mode == "📊 成績ダッシュボード・結果入力":
 
     st.header("📊 成績ダッシュボード")
@@ -4288,9 +4321,8 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         st.stop()
 
     all_history_df = sanitize_df_types(all_history_df)
-    history_dates = pd.to_datetime(all_history_df["開催日"], errors="coerce")
-    live_start_ts = pd.Timestamp(LIVE_LOG_START_DATE)
-    df = all_history_df.loc[history_dates >= live_start_ts].copy()
+    # df は表示・集計専用。保存処理には all_history_df を使う。
+    df = filter_live_history_df(all_history_df)
 
     if df.empty:
         st.info(f"{LIVE_LOG_START_DATE.replace('-', '/')}以降の実戦ログはまだありません。")
@@ -4367,8 +4399,8 @@ elif mode == "📊 成績ダッシュボード・結果入力":
         st.info("保存済みの買い目はまだありません。")
     else:
         all_bet_df = normalize_bet_columns(all_bet_df)
-        bet_dates = pd.to_datetime(all_bet_df["開催日"], errors="coerce")
-        bet_df = all_bet_df.loc[bet_dates >= live_start_ts].copy()
+        # bet_df は表示・集計専用。保存処理には all_bet_df を使う。
+        bet_df = filter_live_bet_df(all_bet_df)
 
         if bet_df.empty:
             st.info(f"{LIVE_LOG_START_DATE.replace('-', '/')}以降の実戦買い目はまだありません。")
