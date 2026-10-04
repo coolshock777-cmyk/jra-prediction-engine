@@ -2239,6 +2239,8 @@ def _parse_payout_rows(payout_rows):
                 ]
 
             # 払戻セルから「円」付き金額をすべて取得。
+            # 払戻額は必ず「円」付きの値を優先し、人気順などの数字を
+            # 払戻額として誤採用しない。
             amounts = [
                 int(x.replace(",", ""))
                 for x in re.findall(r"([0-9][0-9,]*)\s*円", amount_cell)
@@ -2340,9 +2342,15 @@ def calculate_bet_return_from_result(bet_row, payout_map):
             payout100 = payout_map.get(bet_type, {}).get(key)
             if payout100 is None:
                 continue
-            returned = int(round(float(payout100) * amount / 100.0))
+            # JRA/netkeibaの払戻額は「100円購入時の払戻額」。
+            # 保存買い目の購入額が100円を超える場合は比例計算する。
+            # 例: 払戻1,540円/100円 × 購入1,300円 = 20,020円。
+            returned = int(round(float(payout100) * float(amount) / 100.0))
             total += returned
-            hits.append(f"{bet_type} {ticket}: {returned:,}円")
+            hits.append(
+                f"{bet_type} {ticket}: 払戻{int(payout100):,}円/100円 "
+                f"× 購入{int(amount):,}円 = {returned:,}円"
+            )
     return total, hits
 
 
@@ -4257,6 +4265,10 @@ if mode == "🏇 リアルタイム予想":
                         payout_df,
                         use_container_width=True,
                         hide_index=True,
+                    )
+                    st.caption(
+                        "※ 払戻額は100円購入時の金額です。保存済み買い目の回収額は "
+                        "払戻額 × 購入金額 ÷ 100 で自動計算します。"
                     )
 
                 if st.button(
