@@ -192,9 +192,10 @@ st.set_page_config(
     layout="wide",
 )
 
-# Ver.2.50: 出馬表から馬齢・性別を取得し、出馬馬表示と予想結果へ追加。
+# Ver.2.51: 取得したレース実開催日を画面の開催日に反映。
+# Ver.2.50の馬齢・性別追加は維持。
 # 既存の予想ロジック・買い目ロジック自体は変更しない。
-VERSION = "Ver.2.50"
+VERSION = "Ver.2.51"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -4264,11 +4265,18 @@ if mode == "🏇 リアルタイム予想":
 
     c1, c2, c3, c4 = st.columns(4)
 
+    # Ver.2.51: 開催日は「今日」を固定表示するのではなく、
+    # 取得済みレースの実開催日を優先して表示する。
+    if "selected_race_date" not in st.session_state:
+        st.session_state["selected_race_date"] = pd.Timestamp.now().date()
+
     with c1:
         selected_date = st.date_input(
             "開催日",
-            value=pd.Timestamp.now(),
+            value=st.session_state["selected_race_date"],
+            key="selected_race_date_input",
         )
+        st.session_state["selected_race_date"] = selected_date
 
     with c2:
         selected_venue = st.selectbox(
@@ -4343,6 +4351,17 @@ if mode == "🏇 リアルタイム予想":
             st.session_state["fetched_info"] = info
             st.session_state["latest_prediction"] = None
             st.session_state["race_result"] = None
+
+            # 取得データ側の実開催日をUIへ反映する。
+            # race_idの対象レースと開催日表示がズレるのを防ぐ。
+            actual_race_date = info.get("race_date") if isinstance(info, dict) else None
+            if actual_race_date is not None:
+                try:
+                    actual_race_date = pd.Timestamp(actual_race_date).date()
+                    st.session_state["selected_race_date"] = actual_race_date
+                except Exception:
+                    pass
+
             st.rerun()
 
     fetched_info = st.session_state.get(
