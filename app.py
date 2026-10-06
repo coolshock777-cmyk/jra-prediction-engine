@@ -192,7 +192,9 @@ st.set_page_config(
     layout="wide",
 )
 
-VERSION = "Ver.2.49"
+# Ver.2.50: 出馬表から馬齢・性別を取得し、出馬馬表示と予想結果へ追加。
+# 既存の予想ロジック・買い目ロジック自体は変更しない。
+VERSION = "Ver.2.50"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -906,6 +908,50 @@ def extract_kinryo(row):
                 return value
 
     return None
+
+
+def extract_age_sex(row):
+    """出馬表の性齢欄から性別と馬齢を取得する。
+
+    netkeibaの出馬表では「牡3」「牝4」「セ5」などの
+    性齢表記が使われる。class名に依存しすぎず、各tdの
+    完全一致を優先して取得するため、斤量など別の数字を拾わない。
+    未取得時は (None, "") を返す。
+    """
+    try:
+        for td in row.find_all("td"):
+            txt = normalize_text(td.get_text(" ", strip=True))
+            txt = txt.replace(" ", "")
+
+            match = re.fullmatch(r"(牡|牝|セ|騸)(\d{1,2})", txt)
+            if match:
+                sex = match.group(1)
+                if sex == "騸":
+                    sex = "セ"
+                age = int(match.group(2))
+                if 1 <= age <= 20:
+                    return age, sex
+
+        # class名が残っている場合の補完
+        for selector in (
+            "[class*='Barei']",
+            "[class*='SexAge']",
+            "[class*='Age']",
+        ):
+            for elem in row.select(selector):
+                txt = normalize_text(elem.get_text(" ", strip=True)).replace(" ", "")
+                match = re.fullmatch(r"(牡|牝|セ|騸)(\d{1,2})", txt)
+                if match:
+                    sex = match.group(1)
+                    if sex == "騸":
+                        sex = "セ"
+                    age = int(match.group(2))
+                    if 1 <= age <= 20:
+                        return age, sex
+    except Exception:
+        pass
+
+    return None, ""
 
 
 
@@ -2893,6 +2939,7 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                 jockey = extract_jockey(row)
                 trainer = extract_trainer(row)
                 kinryo = extract_kinryo(row)
+                age, sex = extract_age_sex(row)
 
                 # ------------------------------------------------
                 # オッズ：APIを最優先
@@ -3063,6 +3110,8 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     "騎手": jockey,
                     "調教師": trainer,
                     "前走騎手": previous_jockey,
+                    "馬齢": age,
+                    "性別": sex,
                     "斤量": kinryo,
                     "馬体重": bataiju,
                     "馬体重増減": bataiju_diff,
@@ -3081,6 +3130,10 @@ def fetch_netkeiba_race_data_cached(race_id: str, requested_date: str = "", refr
                     quality += 2
                 if candidate["斤量"] is not None:
                     quality += 2
+                if candidate["馬齢"] is not None:
+                    quality += 1
+                if candidate["性別"]:
+                    quality += 1
                 if candidate["馬体重"] is not None:
                     quality += 1
                 if candidate["脚質"] != "不明":
@@ -4061,6 +4114,8 @@ def build_display_horse_df(horses):
     for horse in horses:
         odds = horse.get("オッズ")
         kinryo = horse.get("斤量")
+        age = horse.get("馬齢")
+        sex = horse.get("性別")
 
         rows.append({
             "枠番": int(horse.get("枠番", 0) or 0),
@@ -4068,6 +4123,12 @@ def build_display_horse_df(horses):
             "馬名": str(horse.get("馬名", "")),
             "騎手": str(horse.get("騎手") or "不明"),
             "調教師": str(horse.get("調教師") or "不明"),
+            "性別": str(sex or "-"),
+            "馬齢": (
+                str(int(age))
+                if age is not None and pd.notna(age)
+                else "-"
+            ),
             "斤量": (
                 f"{float(kinryo):.1f}"
                 if kinryo is not None
@@ -4690,6 +4751,8 @@ if mode == "🏇 リアルタイム予想":
                 "馬名": str(horse.get("馬名", "")),
                 "騎手": str(horse.get("騎手") or "不明"),
                 "調教師": str(horse.get("調教師") or "不明"),
+                "性別": str(horse.get("性別") or "-"),
+                "馬齢": float(horse["馬齢"]) if horse.get("馬齢") is not None else np.nan,
                 "斤量": float(horse["斤量"]) if horse.get("斤量") is not None else np.nan,
                 "馬体重": float(horse["馬体重"]) if horse.get("馬体重") is not None else np.nan,
                 "馬体重増減": float(horse["馬体重増減"]) if horse.get("馬体重増減") is not None else np.nan,
@@ -4832,6 +4895,7 @@ if mode == "🏇 リアルタイム予想":
         st.markdown("### 📊 出走馬・モデル評価")
 
         st.caption(
+            "馬齢・性別は出馬表の性齢欄から取得します。"
             "オッズ未取得の場合は「-」で表示します。"
             "脚質は通常出馬表に加えて過去走表示ページから補完します。"
         )
@@ -4839,6 +4903,13 @@ if mode == "🏇 リアルタイム予想":
         display_df = latest["result_df"].copy()
 
         # None / NaNを画面上で「-」に統一
+        if "馬齢" in display_df.columns:
+            display_df["馬齢"] = display_df["馬齢"].apply(
+                lambda x: str(int(float(x)))
+                if pd.notna(x)
+                else "-"
+            )
+
         display_df["斤量"] = display_df["斤量"].apply(
             lambda x: f"{float(x):.1f}"
             if pd.notna(x)
