@@ -744,6 +744,82 @@ def extract_race_id(value: str):
     return match.group(1)
 
 
+def validate_race_id_selection(race_id, selected_date, selected_venue, kai, nichi, race_num):
+    """
+    Ver.2.54: 取得前の第1段ダブルチェック。
+    画面で自動決定した開催日・競馬場・開催回・日目・レース番号と
+    実際に取得する12桁レースIDの構造が一致しているか確認する。
+    """
+    rid = extract_race_id(race_id)
+    if not rid or len(rid) != 12:
+        return False, "12桁の有効なレースIDを確認できません。"
+
+    try:
+        expected_year = pd.Timestamp(selected_date).year
+        id_year = int(rid[:4])
+        id_venue_code = rid[4:6]
+        id_kai = int(rid[6:8])
+        id_nichi = int(rid[8:10])
+        id_race_num = int(rid[10:12])
+    except Exception as e:
+        return False, f"レースIDの構造確認に失敗しました: {e}"
+
+    expected_venue_code = VENUE_CODE_MAP.get(selected_venue)
+    checks = []
+
+    if id_year != expected_year:
+        checks.append(f"年: ID={id_year} / 選択={expected_year}")
+    if expected_venue_code and id_venue_code != expected_venue_code:
+        checks.append(f"競馬場: ID={id_venue_code} / 選択={selected_venue}({expected_venue_code})")
+    if int(kai) != id_kai:
+        checks.append(f"開催回: ID={id_kai}回 / 選択={int(kai)}回")
+    if int(nichi) != id_nichi:
+        checks.append(f"日目: ID={id_nichi}日目 / 選択={int(nichi)}日目")
+    if int(race_num) != id_race_num:
+        checks.append(f"レース番号: ID={id_race_num}R / 選択={int(race_num)}R")
+
+    if checks:
+        return False, " / ".join(checks)
+
+    return True, None
+
+
+def validate_fetched_race_data(info, target_race_id, selected_date, selected_venue, race_num):
+    """
+    Ver.2.54: 取得後の第2段ダブルチェック。
+    実際に取得した出馬表のレースID・開催日・競馬場・R番号を再照合する。
+    """
+    if not isinstance(info, dict):
+        return False, "取得データが正しい形式ではありません。"
+
+    expected_id = extract_race_id(target_race_id)
+    actual_id = extract_race_id(info.get("race_id"))
+
+    if expected_id and actual_id and expected_id != actual_id:
+        return False, f"レースID不一致: 取得={actual_id} / 選択={expected_id}"
+
+    actual_venue = normalize_text(info.get("venue"))
+    if actual_venue and actual_venue != normalize_text(selected_venue):
+        return False, f"競馬場不一致: 取得={actual_venue} / 選択={selected_venue}"
+
+    try:
+        actual_num = int(info.get("race_num"))
+        if actual_num != int(race_num):
+            return False, f"レース番号不一致: 取得={actual_num}R / 選択={int(race_num)}R"
+    except Exception:
+        return False, "取得データのレース番号を確認できません。"
+
+    try:
+        expected_date = pd.Timestamp(selected_date).date()
+        actual_date = pd.Timestamp(info.get("race_date")).date()
+        if actual_date != expected_date:
+            return False, f"開催日不一致: 取得={actual_date.strftime('%Y/%m/%d')} / 選択={expected_date.strftime('%Y/%m/%d')}"
+    except Exception:
+        return False, "取得データの開催日を確認できません。"
+
+    return True, None
+
+
 # ============================================================
 # 5. 解析ヘルパー
 # ============================================================
@@ -4448,37 +4524,82 @@ if mode == "🏇 リアルタイム予想":
         use_container_width=True,
         disabled=(session_info is None),
     ):
-        with st.spinner(
-            f"レースID {target_race_id} を取得中..."
-        ):
-            info, error = fetch_netkeiba_race_data(
-                target_race_id,
-                selected_date,
-            )
+        # ----------------------------------------------------
+        # Ver.2.54 第1チェック：取得前にIDと画面選択値を照合
+        # ----------------------------------------------------
+        pre_ok, pre_error = validate_race_id_selection(
+            target_race_id,
+            selected_date,
+            selected_venue,
+            kai_val,
+            nichi_val,
+            race_num,
+        )
 
-        if error:
-            # 取得失敗時も前回の出馬表を残さない。
+        if not pre_ok:
             st.session_state["fetched_info"] = None
             st.session_state["latest_prediction"] = None
             st.session_state["latest_bet"] = None
             st.session_state["race_result"] = None
-            st.error(error)
+            st.error(
+                "⛔ 取得前のダブルチェックで不一致を検出しました。\n\n"
+                f"{pre_error}\n\n"
+                "開催日・競馬場・開催回・日目・レース番号を確認してください。"
+            )
         else:
-            st.session_state["fetched_info"] = info
-            st.session_state["latest_prediction"] = None
-            st.session_state["race_result"] = None
+            with st.spinner(
+                f"レースID {target_race_id} を取得中..."
+            ):
+                info, error = fetch_netkeiba_race_data(
+                    target_race_id,
+                    selected_date,
+                )
 
-            # 取得データ側の実開催日をUIへ反映する。
-            # race_idの対象レースと開催日表示がズレるのを防ぐ。
-            actual_race_date = info.get("race_date") if isinstance(info, dict) else None
-            if actual_race_date is not None:
-                try:
-                    actual_race_date = pd.Timestamp(actual_race_date).date()
-                    st.session_state["selected_race_date"] = actual_race_date
-                except Exception:
-                    pass
+            if error:
+                # 取得失敗時も前回の出馬表を残さない。
+                st.session_state["fetched_info"] = None
+                st.session_state["latest_prediction"] = None
+                st.session_state["latest_bet"] = None
+                st.session_state["race_result"] = None
+                st.error(error)
+            else:
+                # ----------------------------------------------------
+                # Ver.2.54 第2チェック：取得後の実データを再照合
+                # ----------------------------------------------------
+                post_ok, post_error = validate_fetched_race_data(
+                    info,
+                    target_race_id,
+                    selected_date,
+                    selected_venue,
+                    race_num,
+                )
 
-            st.rerun()
+                if not post_ok:
+                    st.session_state["fetched_info"] = None
+                    st.session_state["latest_prediction"] = None
+                    st.session_state["latest_bet"] = None
+                    st.session_state["race_result"] = None
+                    st.error(
+                        "⛔ 取得後のダブルチェックで不一致を検出したため、\n"
+                        "今回の出馬表は採用しません。\n\n"
+                        f"{post_error}"
+                    )
+                else:
+                    st.session_state["fetched_info"] = info
+                    st.session_state["latest_prediction"] = None
+                    st.session_state["race_result"] = None
+
+                    # 取得データ側の実開催日をUIへ反映する。
+                    actual_race_date = info.get("race_date") if isinstance(info, dict) else None
+                    if actual_race_date is not None:
+                        try:
+                            actual_race_date = pd.Timestamp(actual_race_date).date()
+                            st.session_state["selected_race_date"] = actual_race_date
+                        except Exception:
+                            pass
+
+                    st.success("✅ ダブルチェックOK：選択条件と取得レースが一致しました。")
+                    st.rerun()
 
     fetched_info = st.session_state.get(
         "fetched_info"
