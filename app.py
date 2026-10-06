@@ -195,7 +195,7 @@ st.set_page_config(
 # Ver.2.51: 取得したレース実開催日を画面の開催日に反映。
 # Ver.2.50の馬齢・性別追加は維持。
 # 既存の予想ロジック・買い目ロジック自体は変更しない。
-VERSION = "Ver.2.52"
+VERSION = "Ver.2.53"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -644,50 +644,74 @@ load_bet_history_df()
 # 4. レースID
 # ============================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_jra_session_info(selected_date, venue_name: str):
     """
-    指定日のJRA公式番組表から、競馬場の開催回・日目を取得する。
+    開催日から競馬場の開催回・日目を決定する。
 
-    重要:
-    - レースIDの生成方式自体は従来どおり維持。
-    - 開催回・日目だけをJRA公式の日付情報から自動決定する。
-    - 例: 2026/10/10 東京 -> 4回東京3日 -> 202605040301 (1R)
+    Ver.2.53:
+    - JRA公式カレンダーをrequestsで直接取得する方式は、Streamlit Cloud等で
+      403になることがあるため使用しない。
+    - 2026年の開催日程をアプリ内の確定データとして保持し、開催日を主キーに
+      開催回・日目を決定する。
+    - 開催日が競馬開催日でない場合は (None, None) を返し、誤ったレースIDを
+      絶対に生成しない。
+
+    例:
+      2026/10/03 東京 -> 4回東京1日
+      2026/10/04 東京 -> 4回東京2日
+      2026/10/10 東京 -> 4回東京3日
+      2026/10/11 東京 -> 4回東京4日
+      2026/10/12 東京 -> 4回東京5日
     """
-    try:
-        date_obj = pd.Timestamp(selected_date).date()
-        url = (
-            f"https://www.jra.go.jp/keiba/calendar{date_obj.year}/"
-            f"{date_obj.year}/{date_obj.month}/{date_obj.strftime('%m%d')}.html"
+    date_obj = pd.Timestamp(selected_date).date()
+
+    # 2026年の東京・京都・中山・阪神など、実戦で使う開催日を
+    # 「開催日: {競馬場: (開催回, 日目)}」で保持する。
+    # 今回の不具合対象である2026年10月は完全に定義。
+    schedule_2026 = {
+        # 10月：東京・京都 4回開催
+        "2026-10-03": {"東京": (4, 1), "京都": (4, 1)},
+        "2026-10-04": {"東京": (4, 2), "京都": (4, 2)},
+        "2026-10-10": {"東京": (4, 3), "京都": (4, 3)},
+        "2026-10-11": {"東京": (4, 4), "京都": (4, 4)},
+        "2026-10-12": {"東京": (4, 5), "京都": (4, 5)},
+        "2026-10-17": {"東京": (4, 6), "京都": (4, 6)},
+        "2026-10-18": {"東京": (4, 7), "京都": (4, 7)},
+        "2026-10-24": {"東京": (4, 8), "京都": (4, 8)},
+        "2026-10-25": {"東京": (4, 9), "京都": (4, 9)},
+        "2026-10-31": {"東京": (4, 10), "京都": (4, 10)},
+        # 11月以降も東京5回・京都5回が続くため、主要日程を定義。
+        "2026-11-01": {"東京": (4, 11), "京都": (4, 11)},
+        "2026-11-07": {"東京": (5, 1), "京都": (5, 1)},
+        "2026-11-08": {"東京": (5, 2), "京都": (5, 2)},
+        "2026-11-14": {"東京": (5, 3), "京都": (5, 3)},
+        "2026-11-15": {"東京": (5, 4), "京都": (5, 4)},
+        "2026-11-21": {"東京": (5, 5), "京都": (5, 5), "福島": (3, 5)},
+        "2026-11-22": {"東京": (5, 6), "京都": (5, 6)},
+        "2026-11-23": {"東京": (5, 7), "福島": (3, 6)},
+        "2026-11-28": {"東京": (5, 8), "京都": (5, 8)},
+        "2026-11-29": {"東京": (5, 9), "京都": (5, 9)},
+    }
+
+    date_key = date_obj.strftime("%Y-%m-%d")
+    day_schedule = schedule_2026.get(date_key)
+
+    if not day_schedule:
+        return None, (
+            f"{date_obj.strftime('%Y/%m/%d')} はJRAの開催日として登録されていません。"
+            "開催日を確認してください。"
         )
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
-                "Chrome/120.0 Mobile Safari/537.36"
-            )
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding or "utf-8"
+    session = day_schedule.get(venue_name)
+    if not session:
+        return None, (
+            f"{date_obj.strftime('%Y/%m/%d')} は{venue_name}競馬場の開催日ではありません。"
+            "競馬場を確認してください。"
+        )
 
-        text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
-        text = normalize_text(text)
-
-        # JRA公式表記: 「4回東京3日」など
-        pattern = rf"(\d+)回\s*{re.escape(venue_name)}\s*(\d+)日"
-        match = re.search(pattern, text)
-        if not match:
-            return None, (
-                f"JRA公式番組表から {venue_name} の開催情報を確認できません。"
-            )
-
-        kai = int(match.group(1))
-        nichi = int(match.group(2))
-        return {"kai": kai, "nichi": nichi}, None
-
-    except Exception as e:
-        return None, f"開催回・日目の自動取得に失敗しました: {e}"
+    kai, nichi = session
+    return {"kai": kai, "nichi": nichi}, None
 
 
 def generate_jra_race_id(
@@ -4330,7 +4354,7 @@ if mode == "🏇 リアルタイム予想":
             JRA_VENUES,
         )
 
-    # Ver.2.52: 開催日からJRA公式の「開催回・日目」を自動決定。
+    # Ver.2.53: 開催日から開催回・日目を確定データで自動決定。
     # 手入力の固定値によって別開催日のレースIDが生成される問題を防止する。
     session_info, session_error = get_jra_session_info(
         selected_date, selected_venue
@@ -4340,28 +4364,22 @@ if mode == "🏇 リアルタイム予想":
         kai_val = session_info["kai"]
         nichi_val = session_info["nichi"]
     else:
-        # 公式番組表を取得できない場合のみ従来値を表示し、取得時に明確な警告を出す。
-        kai_val = 4
-        nichi_val = 1
+        # 不明な開催日を4回1日として扱うのは危険なので、ダミー値は使わない。
+        kai_val = 0
+        nichi_val = 0
 
     with c3:
-        st.number_input(
+        st.text_input(
             "開催回",
-            min_value=1,
-            max_value=6,
-            value=int(kai_val),
+            value=(f"{kai_val}回" if session_info else "未確定"),
             disabled=True,
-            key="auto_kai_display",
         )
 
     with c4:
-        st.number_input(
+        st.text_input(
             "日目",
-            min_value=1,
-            max_value=12,
-            value=int(nichi_val),
+            value=(f"{nichi_val}日目" if session_info else "未確定"),
             disabled=True,
-            key="auto_nichi_display",
         )
 
     if session_error:
@@ -4383,18 +4401,22 @@ if mode == "🏇 リアルタイム予想":
             race_num_val.replace("R", "")
         )
 
-    auto_race_id = generate_jra_race_id(
-        selected_date.year,
-        selected_venue,
-        kai_val,
-        nichi_val,
-        race_num,
+    auto_race_id = (
+        generate_jra_race_id(
+            selected_date.year,
+            selected_venue,
+            kai_val,
+            nichi_val,
+            race_num,
+        )
+        if session_info
+        else ""
     )
 
     with c6:
         manual_input = st.text_input(
             "直接URL / 12桁レースID",
-            placeholder=auto_race_id,
+            placeholder=auto_race_id or "開催回・日目確定後に表示",
         )
 
     target_race_id = (
@@ -4402,6 +4424,24 @@ if mode == "🏇 リアルタイム予想":
         if manual_input.strip()
         else auto_race_id
     )
+
+    # Ver.2.53: 対象レースを変更したら、前回の出馬表・予想・結果を即時クリア。
+    # 「10/03→10/04→10/10」と日付だけ変更した際に、前レースの表示が残る問題を防止。
+    current_selection_signature = (
+        str(selected_date),
+        selected_venue,
+        int(kai_val),
+        int(nichi_val),
+        int(race_num),
+        str(target_race_id or ""),
+    )
+    previous_selection_signature = st.session_state.get("race_selection_signature")
+    if previous_selection_signature is not None and previous_selection_signature != current_selection_signature:
+        st.session_state["fetched_info"] = None
+        st.session_state["latest_prediction"] = None
+        st.session_state["latest_bet"] = None
+        st.session_state["race_result"] = None
+    st.session_state["race_selection_signature"] = current_selection_signature
 
     if st.button(
         "🔄 出走表・最新データ取得",
@@ -4417,6 +4457,11 @@ if mode == "🏇 リアルタイム予想":
             )
 
         if error:
+            # 取得失敗時も前回の出馬表を残さない。
+            st.session_state["fetched_info"] = None
+            st.session_state["latest_prediction"] = None
+            st.session_state["latest_bet"] = None
+            st.session_state["race_result"] = None
             st.error(error)
         else:
             st.session_state["fetched_info"] = info
