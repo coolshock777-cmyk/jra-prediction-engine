@@ -195,7 +195,7 @@ st.set_page_config(
 # Ver.2.51: 取得したレース実開催日を画面の開催日に反映。
 # Ver.2.50の馬齢・性別追加は維持。
 # 既存の予想ロジック・買い目ロジック自体は変更しない。
-VERSION = "Ver.2.51"
+VERSION = "Ver.2.52"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -643,6 +643,52 @@ load_bet_history_df()
 # ============================================================
 # 4. レースID
 # ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_jra_session_info(selected_date, venue_name: str):
+    """
+    指定日のJRA公式番組表から、競馬場の開催回・日目を取得する。
+
+    重要:
+    - レースIDの生成方式自体は従来どおり維持。
+    - 開催回・日目だけをJRA公式の日付情報から自動決定する。
+    - 例: 2026/10/10 東京 -> 4回東京3日 -> 202605040301 (1R)
+    """
+    try:
+        date_obj = pd.Timestamp(selected_date).date()
+        url = (
+            f"https://www.jra.go.jp/keiba/calendar{date_obj.year}/"
+            f"{date_obj.year}/{date_obj.month}/{date_obj.strftime('%m%d')}.html"
+        )
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+                "Chrome/120.0 Mobile Safari/537.36"
+            )
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+
+        text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
+        text = normalize_text(text)
+
+        # JRA公式表記: 「4回東京3日」など
+        pattern = rf"(\d+)回\s*{re.escape(venue_name)}\s*(\d+)日"
+        match = re.search(pattern, text)
+        if not match:
+            return None, (
+                f"JRA公式番組表から {venue_name} の開催情報を確認できません。"
+            )
+
+        kai = int(match.group(1))
+        nichi = int(match.group(2))
+        return {"kai": kai, "nichi": nichi}, None
+
+    except Exception as e:
+        return None, f"開催回・日目の自動取得に失敗しました: {e}"
+
 
 def generate_jra_race_id(
     year: int,
@@ -4284,20 +4330,44 @@ if mode == "🏇 リアルタイム予想":
             JRA_VENUES,
         )
 
+    # Ver.2.52: 開催日からJRA公式の「開催回・日目」を自動決定。
+    # 手入力の固定値によって別開催日のレースIDが生成される問題を防止する。
+    session_info, session_error = get_jra_session_info(
+        selected_date, selected_venue
+    )
+
+    if session_info:
+        kai_val = session_info["kai"]
+        nichi_val = session_info["nichi"]
+    else:
+        # 公式番組表を取得できない場合のみ従来値を表示し、取得時に明確な警告を出す。
+        kai_val = 4
+        nichi_val = 1
+
     with c3:
-        kai_val = st.number_input(
+        st.number_input(
             "開催回",
             min_value=1,
             max_value=6,
-            value=4,
+            value=int(kai_val),
+            disabled=True,
+            key="auto_kai_display",
         )
 
     with c4:
-        nichi_val = st.number_input(
+        st.number_input(
             "日目",
             min_value=1,
             max_value=12,
-            value=1,
+            value=int(nichi_val),
+            disabled=True,
+            key="auto_nichi_display",
+        )
+
+    if session_error:
+        st.warning(
+            f"⚠️ {session_error}\n\n"
+            "開催回・日目を自動確認できないため、出走表取得は停止します。"
         )
 
     c5, c6 = st.columns([1, 2])
@@ -4336,6 +4406,7 @@ if mode == "🏇 リアルタイム予想":
     if st.button(
         "🔄 出走表・最新データ取得",
         use_container_width=True,
+        disabled=(session_info is None),
     ):
         with st.spinner(
             f"レースID {target_race_id} を取得中..."
