@@ -378,6 +378,61 @@ def load_history_df():
     return st.session_state["history_df"]
 
 
+def show_history_diagnostics():
+    """履歴CSVの実行環境を確認する読み取り専用の一時鑑識。
+
+    ※ この関数はCSVを保存・変更・削除しない。
+    """
+    path = os.path.abspath(CSV_FILENAME)
+
+    st.markdown("### 🔍 履歴CSV鑑識（読み取り専用）")
+    st.write("モデルバージョン:", VERSION)
+    st.write("実行フォルダ:", os.getcwd())
+    st.write("CSV絶対パス:", path)
+    st.write("CSV存在:", os.path.exists(path))
+
+    if not os.path.exists(path):
+        st.error("🚨 JRA_Prediction_History.csv が実行環境に存在しません。")
+        return
+
+    try:
+        stat = os.stat(path)
+        st.write("CSVサイズ(bytes):", stat.st_size)
+        st.write(
+            "CSV更新時刻:",
+            datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+        raw = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+        st.write("CSV総行数:", len(raw))
+
+        if "開催日" in raw.columns:
+            dates = pd.to_datetime(raw["開催日"], errors="coerce")
+            count_1004 = int(
+                (dates.dt.strftime("%Y-%m-%d") == "2026-10-04").sum()
+            )
+            count_live = int(
+                (dates >= pd.Timestamp("2026-10-04")).sum()
+            )
+            st.write("2026/10/04行数:", count_1004)
+            st.write("2026/10/04以降行数:", count_live)
+            st.write("最古開催日:", dates.min())
+            st.write("最新開催日:", dates.max())
+        else:
+            st.warning("CSVに『開催日』列がありません。")
+
+        if "予測ログID" in raw.columns:
+            ids = raw["予測ログID"].astype(str)
+            st.write("予測ログID数:", ids.nunique())
+            st.write("予測ログID一覧:")
+            st.code("\n".join(ids.tolist()) if len(ids) else "(なし)")
+        else:
+            st.warning("CSVに『予測ログID』列がありません。")
+
+    except Exception as e:
+        st.error(f"🚨 鑑識読み込みエラー: {type(e).__name__}: {e}")
+
+
 def _excel_safe_csv_df(df: pd.DataFrame) -> pd.DataFrame:
     """Excelで直接開いたときの文字コード・長いIDの自動変換を防ぐための出力用整形。
 
@@ -5610,6 +5665,11 @@ elif mode == "📊 成績ダッシュボード・結果入力":
 
     # 全履歴はそのまま保持し、ダッシュボードだけ実戦開始日以降に絞る。
     all_history_df = load_history_df()
+
+    # 🚔 一時鑑識：CSVの実行環境・存在・行数だけを読み取り確認。
+    # CSVへの保存・変更・削除は一切行わない。
+    show_history_diagnostics()
+
     all_history_df, _history_fields_changed = enrich_history_log_fields(all_history_df)
     if all_history_df.empty:
         st.info("まだ予測履歴がありません。")
