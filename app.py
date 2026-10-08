@@ -195,7 +195,7 @@ st.set_page_config(
 # Ver.2.51: 取得したレース実開催日を画面の開催日に反映。
 # Ver.2.50の馬齢・性別追加は維持。
 # 既存の予想ロジック・買い目ロジック自体は変更しない。
-VERSION = "Ver.2.53"
+VERSION = "Ver.2.55 SAFE"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -237,6 +237,12 @@ ALL_DISTANCES_WITH_OTHER = ALL_DISTANCES + ["その他"]
 
 CSV_FILENAME = "JRA_Prediction_History.csv"
 BET_CSV_FILENAME = "JRA_Bet_History.csv"
+
+# Ver.2.55 SAFE: Drive Web Appへ送信を許可するCSVを固定する。
+DRIVE_ALLOWED_FILENAMES = {
+    CSV_FILENAME,
+    BET_CSV_FILENAME,
+}
 
 # Ver.2.49: 実戦ログの集計開始日。既存のテストログはCSVに残すが、
 # 成績ダッシュボードの集計・表示対象からはこの日より前を除外する。
@@ -376,61 +382,6 @@ def load_history_df():
     if "history_df" not in st.session_state:
         st.session_state["history_df"] = pd.DataFrame(columns=CSV_COLUMNS)
     return st.session_state["history_df"]
-
-
-def show_history_diagnostics():
-    """履歴CSVの実行環境を確認する読み取り専用の一時鑑識。
-
-    ※ この関数はCSVを保存・変更・削除しない。
-    """
-    path = os.path.abspath(CSV_FILENAME)
-
-    st.markdown("### 🔍 履歴CSV鑑識（読み取り専用）")
-    st.write("モデルバージョン:", VERSION)
-    st.write("実行フォルダ:", os.getcwd())
-    st.write("CSV絶対パス:", path)
-    st.write("CSV存在:", os.path.exists(path))
-
-    if not os.path.exists(path):
-        st.error("🚨 JRA_Prediction_History.csv が実行環境に存在しません。")
-        return
-
-    try:
-        stat = os.stat(path)
-        st.write("CSVサイズ(bytes):", stat.st_size)
-        st.write(
-            "CSV更新時刻:",
-            datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        raw = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
-        st.write("CSV総行数:", len(raw))
-
-        if "開催日" in raw.columns:
-            dates = pd.to_datetime(raw["開催日"], errors="coerce")
-            count_1004 = int(
-                (dates.dt.strftime("%Y-%m-%d") == "2026-10-04").sum()
-            )
-            count_live = int(
-                (dates >= pd.Timestamp("2026-10-04")).sum()
-            )
-            st.write("2026/10/04行数:", count_1004)
-            st.write("2026/10/04以降行数:", count_live)
-            st.write("最古開催日:", dates.min())
-            st.write("最新開催日:", dates.max())
-        else:
-            st.warning("CSVに『開催日』列がありません。")
-
-        if "予測ログID" in raw.columns:
-            ids = raw["予測ログID"].astype(str)
-            st.write("予測ログID数:", ids.nunique())
-            st.write("予測ログID一覧:")
-            st.code("\n".join(ids.tolist()) if len(ids) else "(なし)")
-        else:
-            st.warning("CSVに『予測ログID』列がありません。")
-
-    except Exception as e:
-        st.error(f"🚨 鑑識読み込みエラー: {type(e).__name__}: {e}")
 
 
 def _excel_safe_csv_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -634,6 +585,19 @@ def sync_csv_to_google_drive(filename: str):
     サービスアカウントJSONやGoogle Cloudの鍵は使用しない。
     Web App側がユーザーのGoogle Drive権限で同名CSVを更新/新規作成する。
     """
+    filename = str(filename).strip()
+    if filename not in DRIVE_ALLOWED_FILENAMES:
+        msg = f"Drive同期を拒否: 許可されていないファイル名です: {filename}"
+        _set_drive_sync_status(filename, False, msg)
+        st.warning(f"⚠️ {msg}")
+        return False
+
+    if not os.path.exists(filename):
+        msg = f"Drive同期を拒否: ローカルCSVが存在しません: {filename}"
+        _set_drive_sync_status(filename, False, msg)
+        st.warning(f"⚠️ {msg}")
+        return False
+
     if not _google_drive_configured():
         _set_drive_sync_status(
             filename,
@@ -4374,6 +4338,24 @@ if _google_drive_configured():
 else:
     st.sidebar.info("Google Drive: 未設定")
 
+# Ver.2.55 SAFE: 既存CSVそのものを変更せず、Drive同期だけを手動実行する検証ボタン。
+# 予想・結果確定・買い目生成などのロジックは実行しない。
+if _google_drive_configured():
+    if st.sidebar.button("🔎 Google Drive保存テスト", use_container_width=True):
+        test_results = {}
+        for _filename in (CSV_FILENAME, BET_CSV_FILENAME):
+            if os.path.exists(_filename):
+                test_results[_filename] = sync_csv_to_google_drive(_filename)
+        if test_results.get(CSV_FILENAME):
+            st.sidebar.success("予測履歴CSVのDrive同期に成功しました。")
+        elif os.path.exists(CSV_FILENAME):
+            st.sidebar.error("予測履歴CSVのDrive同期に失敗しました。警告内容を確認してください。")
+        if os.path.exists(BET_CSV_FILENAME):
+            if test_results.get(BET_CSV_FILENAME):
+                st.sidebar.success("買い目履歴CSVのDrive同期に成功しました。")
+            else:
+                st.sidebar.error("買い目履歴CSVのDrive同期に失敗しました。")
+
 mode = st.sidebar.radio(
     "機能メニュー",
     [
@@ -5665,11 +5647,6 @@ elif mode == "📊 成績ダッシュボード・結果入力":
 
     # 全履歴はそのまま保持し、ダッシュボードだけ実戦開始日以降に絞る。
     all_history_df = load_history_df()
-
-    # 🚔 一時鑑識：CSVの実行環境・存在・行数だけを読み取り確認。
-    # CSVへの保存・変更・削除は一切行わない。
-    show_history_diagnostics()
-
     all_history_df, _history_fields_changed = enrich_history_log_fields(all_history_df)
     if all_history_df.empty:
         st.info("まだ予測履歴がありません。")
