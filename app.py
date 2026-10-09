@@ -11,32 +11,23 @@ import io
 from datetime import datetime
 
 # ================================================================
-# Ver.2.43 新馬・初出走判定
+# Ver.2.56 DATAFIX: 新馬・初出走判定の誤判定防止
 # ================================================================
 def detect_first_start_v241(past_soup, horse_name="", race_name="", race_soup=None):
-    """新馬・初出走を脚質取得より優先して判定する。"""
+    """対象レース名または対象馬自身の履歴だけを使って初出走を判定する。
+
+    race_soup全体には他レースへのリンクやナビゲーションも含まれるため、
+    ページ全体に「新馬」が1語あるだけで全馬を初出走扱いにする判定は禁止。
+    race_soup引数は既存呼び出し互換のため残すが、判定には使用しない。
+    """
     try:
-        blobs = []
-        for x in (race_name, horse_name):
-            if x:
-                blobs.append(normalize_text(str(x)))
-
-        if race_soup is not None:
-            try:
-                blobs.append(normalize_text(race_soup.get_text(" ", strip=True)))
-                for tag in race_soup.find_all(["h1","h2","h3","div","span","p"], limit=500):
-                    t = normalize_text(tag.get_text(" ", strip=True))
-                    if t:
-                        blobs.append(t)
-            except Exception:
-                pass
-
-        blob = " ".join(blobs)
-        if re.search(r"(?:新馬戦?|メイクデビュー)", blob, re.I):
+        current_race_name = normalize_text(str(race_name or ""))
+        if current_race_name and re.search(r"(?:新馬|メイクデビュー)", current_race_name, re.I):
             return True
 
         target = normalize_text(str(horse_name or ""))
         if past_soup is not None and target:
+            # 馬名が実際に含まれる行だけを調べ、別馬の履歴を根拠にしない。
             for row in past_soup.find_all("tr"):
                 txt = normalize_text(row.get_text(" ", strip=True))
                 if target in txt and re.search(
@@ -195,7 +186,7 @@ st.set_page_config(
 # Ver.2.51: 取得したレース実開催日を画面の開催日に反映。
 # Ver.2.50の馬齢・性別追加は維持。
 # 既存の予想ロジック・買い目ロジック自体は変更しない。
-VERSION = "Ver.2.55 SAFE"
+VERSION = "Ver.2.56 DATAFIX SAFE"
 APP_TITLE = "🏇 JRA AI予想 & 成績検証エンジン"
 
 JRA_VENUES = [
@@ -238,7 +229,7 @@ ALL_DISTANCES_WITH_OTHER = ALL_DISTANCES + ["その他"]
 CSV_FILENAME = "JRA_Prediction_History.csv"
 BET_CSV_FILENAME = "JRA_Bet_History.csv"
 
-# Ver.2.55 SAFE: Drive Web Appへ送信を許可するCSVを固定する。
+# Ver.2.56 DATAFIX SAFE: Drive Web Appへの同期対象制限は従来どおり維持する。
 DRIVE_ALLOWED_FILENAMES = {
     CSV_FILENAME,
     BET_CSV_FILENAME,
@@ -1407,71 +1398,47 @@ def extract_style_from_past_row(row) -> str:
 
 
 def find_past_row(soup, horse_number: int, horse_name: str):
-    """過去走ページから対象馬の行を馬番・馬名・リンク情報で強力に特定する。"""
+    """過去走ページから対象馬の行を馬名優先で特定する。
+
+    現在の出馬表の馬番と前走レースの馬番は別物なので、馬番だけの一致を
+    馬名より先に採用すると別馬の前走騎手・脚質を誤取得する。
+    """
     if soup is None:
         return None
 
     rows = soup.find_all("tr")
     target = normalize_text(horse_name)
 
-    # 1. 専用の馬番セル
-    for row in rows:
-        num = extract_number_by_class(row, r"Umaban")
-        if num == horse_number:
-            return row
-
-    # 2. 馬名リンクを最優先。
-    # netkeibaでは同一馬名が複数箇所に出ることがあるため、
-    # /horse/ を含むリンクを優先する。
+    # 1. 対象馬名と完全一致する馬名リンクを優先
     if target:
         for a in soup.find_all("a", href=True):
             href = str(a.get("href", ""))
             txt = normalize_text(a.get_text(" ", strip=True))
-            if "/horse/" in href and txt and target == txt:
+            if "/horse/" in href and txt == target:
                 row = a.find_parent("tr")
                 if row is not None:
                     return row
 
-    # 3. 馬名一致 -> 最も近いtr
-    if target:
-        for node in soup.find_all(string=re.compile(re.escape(target), re.I)):
-            parent = node.parent
-            for _ in range(8):
-                if parent is None:
-                    break
-                if getattr(parent, "name", None) == "tr":
-                    txt = normalize_text(parent.get_text(" ", strip=True))
-                    if target in txt:
-                        return parent
-                parent = parent.parent
-
-    # 4. row単位の馬名一致
+    # 2. 馬名が含まれる行を優先。番号は照合の補助にのみ使う。
     if target:
         for row in rows:
             row_text = normalize_text(row.get_text(" ", strip=True))
             if target in row_text and len(row_text) < 8000:
                 return row
 
-    # 5. 馬番 + 馬名の組合せ
-    for row in rows:
-        row_text = normalize_text(row.get_text(" ", strip=True))
-        num_hit = bool(
-            re.search(
-                rf"(?<!\d){re.escape(str(horse_number))}(?!\d)",
-                row_text
-            )
-        )
-        name_hit = bool(target and target in row_text)
-        if num_hit and name_hit:
-            return row
+    # 3. 馬名が見つからない場合に限り、馬番だけの照合を許可する。
+    # 対象馬名が指定されているのに見つからない場合は、別馬を返さず未取得にする。
+    if target:
+        return None
 
-    # 6. 最後のフォールバック：馬番だけ。ただしセルの境界を厳密に確認
+    for row in rows:
+        num = extract_number_by_class(row, r"Umaban")
+        if num == horse_number:
+            return row
     for row in rows:
         for td in row.find_all(["td", "th"]):
-            txt = normalize_text(td.get_text(" ", strip=True))
-            if txt == str(horse_number):
+            if normalize_text(td.get_text(" ", strip=True)) == str(horse_number):
                 return row
-
     return None
 
 
@@ -4338,7 +4305,7 @@ if _google_drive_configured():
 else:
     st.sidebar.info("Google Drive: 未設定")
 
-# Ver.2.55 SAFE: 既存CSVそのものを変更せず、Drive同期だけを手動実行する検証ボタン。
+# Ver.2.56 DATAFIX SAFE: 既存CSVそのものを変更せず、Drive同期だけを手動実行する検証ボタン。
 # 予想・結果確定・買い目生成などのロジックは実行しない。
 if _google_drive_configured():
     if st.sidebar.button("🔎 Google Drive保存テスト", use_container_width=True):
